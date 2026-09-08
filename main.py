@@ -9,7 +9,7 @@ import anthropic
 # 1. Load environment variables
 load_dotenv()
 
-app = FastAPI(title="PersonAIs Alpha 0.3.3 Engine")
+app = FastAPI(title="PersonAIs Alpha 0.4.0 Engine", version="0.4.0")
 
 # 2. Production CORS Security Bridge
 app.add_middleware(
