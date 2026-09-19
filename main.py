@@ -17,7 +17,7 @@ load_dotenv()
 
 logger = logging.getLogger("personais.engine")
 
-APP_VERSION = "0.4.2"
+APP_VERSION = "0.4.3"
 
 # Result of the boot-time self test, surfaced on /api/health.
 engine_selftest = {"status": "not run", "detail": None}
@@ -147,28 +147,45 @@ if anthropic_key_problem:
     # surfacing as a 401 the first time somebody tries to chat.
     print(f"🛑 CRITICAL ERROR: {anthropic_key_problem}. /api/chat will refuse until this is fixed.")
 
-# An API key that is not scoped to a workspace has to name one per request, or
-# the API can reject the call. The SDK takes it as a request parameter
-# (messages.create(workspace_id=...)) — 0.4.1 sent it as an 'anthropic-
-# workspace-id' header instead, which the API does not read, so setting it had
-# no effect. Only sent when configured; a workspace-scoped key needs nothing.
+# An API key that is NOT scoped to a workspace must name a workspace on every
+# request, or the API rejects it with a 400 telling you to add the
+# 'anthropic-workspace-id' header. This is what was actually breaking every
+# chat message in 0.4.1 and 0.4.2: the mechanism was here, but
+# ANTHROPIC_WORKSPACE_ID was never set in the environment, so nothing was sent.
+#
+# It goes on the client rather than on each request so that *every* endpoint
+# carries it — including GET /v1/models, which the boot check uses and which
+# 0.4.2 left unscoped (hence an empty served_models list).
+#
+# A workspace-scoped key needs none of this, so the header is only sent when
+# the variable is set.
 anthropic_workspace_id = clean_secret(os.getenv("ANTHROPIC_WORKSPACE_ID"))
 
-anthropic_client = anthropic.Anthropic(api_key=anthropic_api_key or None)
+anthropic_client = anthropic.Anthropic(
+    api_key=anthropic_api_key or None,
+    default_headers=(
+        {"anthropic-workspace-id": anthropic_workspace_id}
+        if anthropic_workspace_id
+        else None
+    ),
+)
 
 # --- Model configuration -------------------------------------------------
 #
-# ONE model serves every tier. 0.4.1 routed pro/ultra accounts to a separate
-# "claude-fable-5", which this account cannot serve: the API answers a model it
-# will not serve with a 404, which reached the browser as the flat "The AI
-# engine is not set up correctly" — a sentence that names neither the model nor
-# the tier, which is why it looked like a key problem. Pro-tier accounts now
-# get the same working model as everyone else. Do NOT reintroduce a second
-# model id until that model is actually available on this API key; the boot
-# check below is what proves it.
+# ONE model serves every tier, and it is "claude-haiku-4-5-20251001" — a real,
+# servable id that was never the fault.
 #
-# The free-tier id was never the fault and is unchanged:
-# "claude-haiku-4-5-20251001" is a real, servable id.
+# 0.4.1 routed pro/ultra accounts to a second id, "claude-fable-5". Whether
+# this key can serve that model is still unknown: the boot check that would
+# answer it (GET /v1/models) was itself blocked by the workspace-scoping 400
+# described above, so served_models came back empty. It stays out until the
+# health page proves it is available AND there is a reason to pay for it.
+# Do NOT reintroduce a second model id before then.
+#
+# 0.4.1 also sent output_config={"effort": ...} on that same pro path. That
+# parameter only applies to models that think; this one rejects it. With one
+# model there is nothing to send it for, so it is gone — one less thing that
+# can be rejected as malformed.
 #
 # Two defences so an unservable id cannot come back silently:
 #   1. The id is overridable from the environment (ANTHROPIC_MODEL), so a
@@ -188,11 +205,6 @@ CHAT_MODEL = CHAT_MODEL_CONFIGURED
 # answer and 1024 tokens is enough for the concise replies this prompt asks
 # for. Raise CHAT_MAX_TOKENS if replies start coming back truncated.
 MAX_TOKENS = positive_int("CHAT_MAX_TOKENS", 1024)
-
-# 0.4.1 also sent output_config={"effort": ...} on the pro path. That parameter
-# only applies to models that think; this model rejects it. With one model
-# there is nothing to send it for, so it is gone — one less thing that can be
-# rejected as malformed.
 
 SYSTEM_PROMPTS = {
     "pro": "You are a highly intelligent, elite digital twin. NEVER refer to yourself as an AI.",
@@ -230,8 +242,46 @@ def provider_message(e: anthropic.APIStatusError) -> str:
     """
     body = getattr(e, "body", None)
     if isinstance(body, dict):
-        return str(body.get("error", {}).get("message", ""))[:200]
+        return str(body.get("error", {}).get("message", ""))[:400]
     return ""
+
+
+# The provider's sentence says what is wrong. These say where to fix it, so a
+# failed boot check names the dashboard field to change instead of leaving the
+# next person to work it out. Matched in order, first hit wins.
+REMEDIES = (
+    ("not scoped to a workspace",
+     "This API key is org-scoped, so every request must name a workspace. Either set "
+     "ANTHROPIC_WORKSPACE_ID (Anthropic Console → Settings → Workspaces → open the "
+     "workspace → its id starts with 'wrkspc_') and restart, or replace "
+     "ANTHROPIC_API_KEY with a key created inside a workspace."),
+    ("workspace",
+     "Something about workspace scoping is wrong. Check ANTHROPIC_WORKSPACE_ID against "
+     "the id in Anthropic Console → Settings → Workspaces, or use a workspace-scoped key."),
+    ("api key is invalid",
+     "The key was rejected. Issue a fresh one in Anthropic Console → Settings → API keys "
+     "and replace ANTHROPIC_API_KEY."),
+    ("credit balance",
+     "The Anthropic account is out of credit. Top it up in Console → Settings → Billing."),
+    ("permission",
+     "The key is valid but not permitted to use this model. Use a key with access, or set "
+     "ANTHROPIC_MODEL to an id from served_models."),
+    ("model:",
+     "That model is not available on this API key. Set ANTHROPIC_MODEL to an id from "
+     "served_models and restart."),
+)
+
+
+def describe_remedy(*details: Optional[str]) -> Optional[str]:
+    """Turn a failure detail into the specific thing to change, if we know it."""
+    for detail in details:
+        if not detail:
+            continue
+        lowered = detail.lower()
+        for needle, remedy in REMEDIES:
+            if needle in lowered:
+                return remedy
+    return None
 
 
 def served_model_ids() -> Optional[list]:
@@ -321,15 +371,12 @@ def build_request_kwargs(tier: str, message: str) -> dict:
     that can be rejected (the model id, the token budget, the workspace id) is
     exercised by both paths or by neither.
     """
-    kwargs = {
+    return {
         "model": CHAT_MODEL,
         "max_tokens": MAX_TOKENS,
         "system": SYSTEM_PROMPTS.get(tier, SYSTEM_PROMPTS["free"]),
         "messages": [{"role": "user", "content": message}],
     }
-    if anthropic_workspace_id:
-        kwargs["workspace_id"] = anthropic_workspace_id
-    return kwargs
 
 
 def extract_reply(message: anthropic.types.Message) -> str:
@@ -415,6 +462,10 @@ def run_engine_selftest() -> None:
         engine_selftest.update(status="failed", detail=detail)
         logger.error("Engine self test FAILED — %s", detail)
         print(f"🛑 Engine self test FAILED — {detail}")
+        remedy = describe_remedy(detail)
+        if remedy:
+            logger.error("Engine self test remedy — %s", remedy)
+            print(f"👉 FIX: {remedy}")
     except Exception as e:
         detail = f"{type(e).__name__} calling {kwargs['model']}"
         engine_selftest.update(status="failed", detail=detail)
@@ -450,6 +501,8 @@ async def health_check():
         "max_tokens": MAX_TOKENS,
         "engine_selftest": engine_selftest["status"],
         "engine_selftest_detail": engine_selftest["detail"],
+        # The specific thing to change, when the failure is one we recognise.
+        "remedy": describe_remedy(engine_selftest["detail"], model_status["detail"]),
         "anthropic_key_configured": has_anthropic_credential,
         "anthropic_key_status": anthropic_key_problem or "ok",
         "anthropic_workspace_id_set": bool(anthropic_workspace_id),

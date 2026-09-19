@@ -283,26 +283,60 @@ check("unreachable model list keeps chat available",
       TestClient(main.app).get("/api/health").json()["status"], "ok")
 
 # --- workspace scoping ---------------------------------------------------
-# The workspace id is a request parameter, not a header (0.4.1 sent a header
-# the API does not read, so setting it did nothing).
+# An org-scoped key must name a workspace on every request. The header goes on
+# the CLIENT, not on each call, so GET /v1/models carries it too — 0.4.2 sent
+# it only on messages.create, which is why served_models came back empty.
+def workspace_header(m):
+    headers = m.anthropic_client.default_headers
+    return {k.lower(): v for k, v in headers.items()}.get("anthropic-workspace-id")
+
 scoped = load(workspace_id="wrkspc_abc123")
+check("workspace header on the client", workspace_header(scoped), "wrkspc_abc123")
 seen = capture(scoped, reply([text_block("ok")]))
 TestClient(scoped.app).post("/api/chat", json={"message": "hi"})
-check("workspace id sent as a request param", seen.get("workspace_id"), "wrkspc_abc123")
+check("workspace not duplicated per request", "workspace_id" in seen, False)
 check("workspace shown on health",
       TestClient(scoped.app).get("/api/health").json()["anthropic_workspace_id_set"], True)
 
 unscoped = load(workspace_id=None)
-seen = capture(unscoped, reply([text_block("ok")]))
-TestClient(unscoped.app).post("/api/chat", json={"message": "hi"})
-check("no workspace param when unset", "workspace_id" in seen, False)
+check("no workspace header when unset", workspace_header(unscoped), None)
 check("workspace absent on health",
       TestClient(unscoped.app).get("/api/health").json()["anthropic_workspace_id_set"], False)
 
 quoted = load(workspace_id='"wrkspc_xyz"\n')
-seen = capture(quoted, reply([text_block("ok")]))
-TestClient(quoted.app).post("/api/chat", json={"message": "hi"})
-check("workspace id sanitized", seen.get("workspace_id"), "wrkspc_xyz")
+check("workspace id sanitized", workspace_header(quoted), "wrkspc_xyz")
+
+# --- remedies ------------------------------------------------------------
+# The live 0.4.2 failure: an org-scoped key with no workspace id set. The
+# health page has to say which dashboard field fixes it.
+main = load()
+WORKSPACE_400 = ("This API key is not scoped to a workspace, so this request must "
+                 "include the anthropic-workspace-id header with the ID of the "
+                 "workspace to use. Add the header, or use an API key that is "
+                 "scoped to a workspace.")
+remedy = main.describe_remedy(f"HTTP 400 calling {main.CHAT_MODEL}: {WORKSPACE_400}")
+check("workspace 400 has a remedy", bool(remedy), True)
+check("remedy names the variable", "ANTHROPIC_WORKSPACE_ID" in remedy, True)
+check("remedy names the alternative key", "ANTHROPIC_API_KEY" in remedy, True)
+check("bad key has a remedy",
+      "API keys" in (main.describe_remedy("HTTP 401: API key is invalid.") or ""), True)
+check("missing model has a remedy",
+      "ANTHROPIC_MODEL" in (main.describe_remedy("HTTP 404: model: claude-fable-5") or ""), True)
+check("unknown failure has no invented remedy",
+      main.describe_remedy("HTTP 500: something exploded"), None)
+check("no failure, no remedy", main.describe_remedy(None, None), None)
+
+probe = load()
+probe.anthropic_client.with_options = lambda **kw: probe.anthropic_client
+probe.anthropic_client.messages.create = api_error(anthropic.BadRequestError, 400, WORKSPACE_400)
+probe.run_engine_selftest()
+health = TestClient(probe.app).get("/api/health").json()
+check("workspace failure degrades health", health["status"], "degraded")
+check("health carries the remedy", "ANTHROPIC_WORKSPACE_ID" in (health["remedy"] or ""), True)
+check("provider sentence is not truncated mid-word",
+      health["engine_selftest_detail"].endswith("scoped to a workspace."), True)
+check("healthy deploy has no remedy",
+      TestClient(load().app).get("/api/health").json()["remedy"], None)
 
 # --- reply extraction ----------------------------------------------------
 main = load()
