@@ -30,10 +30,11 @@ def check(name, got, want):
     results.append((name, got, want))
 
 
-def load(api_key=VALID_KEY, auth_token=None):
+def load(api_key=VALID_KEY, auth_token=None, workspace_id=None):
     """Import main.py fresh with a given credential environment."""
     sys.modules.pop("main", None)
-    for var, value in (("ANTHROPIC_API_KEY", api_key), ("ANTHROPIC_AUTH_TOKEN", auth_token)):
+    for var, value in (("ANTHROPIC_API_KEY", api_key), ("ANTHROPIC_AUTH_TOKEN", auth_token),
+                       ("ANTHROPIC_WORKSPACE_ID", workspace_id)):
         if value is None:
             os.environ.pop(var, None)
         else:
@@ -142,7 +143,36 @@ main.anthropic_client.messages.create = api_error(anthropic.RateLimitError, 429)
 check("rate limit -> 429", client.post("/api/chat", json={"message": "hi"}).status_code, 429)
 
 main.anthropic_client.messages.create = api_error(anthropic.InternalServerError, 500)
-check("upstream 5xx -> 502", client.post("/api/chat", json={"message": "hi"}).status_code, 502)
+res = client.post("/api/chat", json={"message": "hi"})
+check("upstream 5xx -> 502", res.status_code, 502)
+check("5xx invites a retry", "try again" in res.json()["detail"], True)
+
+# A malformed request (unservable model, rejected param, or an unscoped key
+# sent without a workspace id) fails the same way on every retry.
+main.anthropic_client.messages.create = api_error(anthropic.BadRequestError, 400)
+res = client.post("/api/chat", json={"message": "hi"})
+check("400 -> 502", res.status_code, 502)
+check("400 does NOT invite a retry", "retrying will not help" in res.json()["detail"], True)
+
+main.anthropic_client.messages.create = api_error(anthropic.NotFoundError, 404)
+res = client.post("/api/chat", json={"message": "hi"})
+check("unknown model -> 502", res.status_code, 502)
+check("unknown model does NOT invite a retry", "retrying will not help" in res.json()["detail"], True)
+
+# --- workspace scoping ---------------------------------------------------
+def workspace_header(m):
+    return {k.lower(): v for k, v in m.anthropic_client.default_headers.items()}.get("anthropic-workspace-id")
+
+scoped = load(workspace_id="wrkspc_abc123")
+check("workspace header sent when set", workspace_header(scoped), "wrkspc_abc123")
+check("workspace shown on health", TestClient(scoped.app).get("/api/health").json()["anthropic_workspace_id_set"], True)
+
+unscoped = load(workspace_id=None)
+check("no workspace header when unset", workspace_header(unscoped), None)
+check("workspace absent on health", TestClient(unscoped.app).get("/api/health").json()["anthropic_workspace_id_set"], False)
+
+quoted = load(workspace_id='"wrkspc_xyz"\n')
+check("workspace id sanitized", workspace_header(quoted), "wrkspc_xyz")
 
 # --- reply extraction ----------------------------------------------------
 capture(main, reply([thinking_block(), text_block("Hello.")]))
@@ -166,6 +196,7 @@ check("truncated reply still returned", res.json()["reply"], "Partial answ")
 seen = capture(main, reply([text_block("free")]))
 res = client.post("/api/chat", json={"user_id": "guest_tester", "message": "hi"})
 check("guest uses free model", seen["model"], main.FREE_MODEL)
+check("free model id is the dated snapshot", main.FREE_MODEL, "claude-haiku-4-5-20251001")
 check("free model budget", seen["max_tokens"], main.FREE_MAX_TOKENS)
 check("free model sends no effort", "output_config" in seen, False)
 check("guest credits reported", res.json()["remaining_credits"], 19)

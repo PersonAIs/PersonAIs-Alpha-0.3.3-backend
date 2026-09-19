@@ -85,7 +85,19 @@ if anthropic_key_problem:
     # surfacing as a 401 the first time somebody tries to chat.
     print(f"🛑 CRITICAL ERROR: {anthropic_key_problem}. /api/chat will refuse until this is fixed.")
 
-anthropic_client = anthropic.Anthropic(api_key=anthropic_api_key or None)
+# An API key that is not scoped to a workspace must name the workspace on every
+# request, or the API rejects it with a 400 telling you to add this header. A
+# workspace-scoped key needs no header, so only send one when it is configured.
+anthropic_workspace_id = clean_secret(os.getenv("ANTHROPIC_WORKSPACE_ID"))
+
+anthropic_client = anthropic.Anthropic(
+    api_key=anthropic_api_key or None,
+    default_headers=(
+        {"anthropic-workspace-id": anthropic_workspace_id}
+        if anthropic_workspace_id
+        else None
+    ),
+)
 
 # Kept in one place so the tier router and the health probe cannot drift apart.
 #
@@ -100,12 +112,20 @@ PRO_EFFORT = "medium"
 
 # The free model does not think, so it needs no extra headroom — and it
 # rejects the effort parameter outright, so it must not be sent one.
-FREE_MODEL = "claude-haiku-4-5"
+FREE_MODEL = "claude-haiku-4-5-20251001"
 FREE_MAX_TOKENS = 1024
 
 ENGINE_UNAVAILABLE = (
     "The AI engine is not configured correctly. This is a server-side problem, "
     "not something you did — please try again later."
+)
+
+# Kept distinct from ENGINE_UNAVAILABLE: this one means the request itself was
+# rejected as malformed, which fails identically on every retry, so the message
+# must not invite one.
+ENGINE_MISCONFIGURED = (
+    "The AI engine is not set up correctly, so this message could not be "
+    "answered. It has been logged for us to fix — retrying will not help."
 )
 
 
@@ -170,6 +190,7 @@ async def health_check():
         "version": APP_VERSION,
         "anthropic_key_configured": has_anthropic_credential,
         "anthropic_key_status": anthropic_key_problem or "ok",
+        "anthropic_workspace_id_set": bool(anthropic_workspace_id),
         "supabase_configured": bool(supabase_url and supabase_key),
         "models": {"free": FREE_MODEL, "pro": PRO_MODEL},
     }
@@ -252,9 +273,20 @@ async def chat_endpoint(req: ChatRequest):
             status_code=503,
             detail="Could not reach the AI engine. Please try again in a moment.",
         )
+    except anthropic.BadRequestError:
+        # Malformed request: an unservable model id, a rejected parameter, or a
+        # key that is not scoped to a workspace and was sent without one.
+        logger.exception(
+            "Anthropic rejected the request for model %s (workspace id %s)",
+            active_model,
+            "set" if anthropic_workspace_id else "NOT set",
+        )
+        raise HTTPException(status_code=502, detail=ENGINE_MISCONFIGURED)
+    except anthropic.NotFoundError:
+        logger.exception("Anthropic does not serve model %s for this key", active_model)
+        raise HTTPException(status_code=502, detail=ENGINE_MISCONFIGURED)
     except anthropic.APIStatusError as e:
-        # Includes a bad model id (404) and provider-side 5xx. Logged in full,
-        # reported to the caller without the provider's response body.
+        # Anything left is provider-side (5xx) and genuinely worth retrying.
         logger.exception("Anthropic returned %s for model %s", e.status_code, active_model)
         raise HTTPException(
             status_code=502,
