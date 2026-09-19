@@ -213,6 +213,39 @@ check("deduction written back", main.supabase.updated, {"credits_balance": 49})
 main.supabase = FakeSupabase({"subscription_tier": "free", "credits_balance": 0})
 check("no credits -> 403", client.post("/api/chat", json={"user_id": "u", "message": "hi"}).status_code, 403)
 
+# --- boot-time engine self test ------------------------------------------
+# TestClient only runs lifespan inside a context manager, so the suite never
+# fires a real request by accident; call the self test directly instead.
+probe = load()
+probe.anthropic_client.with_options = lambda **kw: probe.anthropic_client
+probe.anthropic_client.messages.create = api_error(anthropic.BadRequestError, 400)
+probe.run_engine_selftest()
+check("selftest catches 400", probe.engine_selftest["status"], "failed")
+check("selftest names the status", "HTTP 400" in probe.engine_selftest["detail"], True)
+check("selftest names the model", probe.FREE_MODEL in probe.engine_selftest["detail"], True)
+check("failed selftest degrades health",
+      TestClient(probe.app).get("/api/health").json()["status"], "degraded")
+
+probe.anthropic_client.messages.create = lambda **kw: reply([text_block("pong")])
+probe.run_engine_selftest()
+check("selftest passes on success", probe.engine_selftest["status"], "ok")
+check("passing selftest keeps health ok",
+      TestClient(probe.app).get("/api/health").json()["status"], "ok")
+
+# A self test must never be able to take the service down.
+def explode(**kwargs):
+    raise RuntimeError("network on fire")
+probe.anthropic_client.messages.create = explode
+probe.run_engine_selftest()
+check("selftest survives unexpected errors", probe.engine_selftest["status"], "failed")
+check("selftest still serves health",
+      TestClient(probe.app).get("/api/health").status_code, 200)
+
+skipped = load(api_key=None)
+skipped.anthropic_client.with_options = lambda **kw: skipped.anthropic_client
+skipped.run_engine_selftest()
+check("selftest skipped without a credential", skipped.engine_selftest["status"], "skipped")
+
 # --- report --------------------------------------------------------------
 failed = 0
 for name, got, want in results:

@@ -1,5 +1,6 @@
 import logging
 import os
+from contextlib import asynccontextmanager
 from typing import Optional
 
 from fastapi import FastAPI, HTTPException
@@ -16,7 +17,21 @@ logger = logging.getLogger("personais.engine")
 
 APP_VERSION = "0.4.1"
 
-app = FastAPI(title=f"PersonAIs Alpha {APP_VERSION} Engine", version=APP_VERSION)
+# Result of the boot-time self test, surfaced on /api/health.
+engine_selftest = {"status": "not run", "detail": None}
+
+
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    run_engine_selftest()
+    yield
+
+
+app = FastAPI(
+    title=f"PersonAIs Alpha {APP_VERSION} Engine",
+    version=APP_VERSION,
+    lifespan=lifespan,
+)
 
 # 2. Production CORS Security Bridge
 app.add_middleware(
@@ -178,6 +193,51 @@ def extract_reply(message: anthropic.types.Message) -> str:
     return text
 
 
+def run_engine_selftest() -> None:
+    """Send one minimal request at boot so a misconfiguration is visible now.
+
+    Every configuration fault in this service so far — a rejected key, an
+    unscoped key, a model the account may not serve — has only surfaced when
+    somebody tried to chat, and then only as a generic message with the real
+    cause buried in the logs. One 1-token call per boot turns each deploy into
+    a self test whose verdict can be read straight off /api/health.
+
+    It can never break startup: every failure path is caught, and the call is
+    given a short timeout with retries disabled so a slow API cannot stall the
+    deploy.
+    """
+    if not has_anthropic_credential:
+        engine_selftest.update(status="skipped", detail=anthropic_key_problem)
+        return
+
+    try:
+        anthropic_client.with_options(timeout=8.0, max_retries=0).messages.create(
+            model=FREE_MODEL,
+            max_tokens=1,
+            messages=[{"role": "user", "content": "ping"}],
+        )
+    except anthropic.APIStatusError as e:
+        # The provider's own wording is the single most useful thing here, so
+        # it is surfaced rather than swallowed. It describes configuration —
+        # never the key itself — and is truncated defensively.
+        provider_message = ""
+        body = getattr(e, "body", None)
+        if isinstance(body, dict):
+            provider_message = str(body.get("error", {}).get("message", ""))[:300]
+        detail = f"HTTP {e.status_code} calling {FREE_MODEL}"
+        if provider_message:
+            detail = f"{detail}: {provider_message}"
+        engine_selftest.update(status="failed", detail=detail)
+        logger.error("Engine self test FAILED — %s", detail)
+    except Exception as e:
+        detail = f"{type(e).__name__} calling {FREE_MODEL}"
+        engine_selftest.update(status="failed", detail=detail)
+        logger.error("Engine self test FAILED — %s", detail)
+    else:
+        engine_selftest.update(status="ok", detail=f"{FREE_MODEL} answered")
+        logger.info("Engine self test OK — %s answered", FREE_MODEL)
+
+
 @app.get("/api/health")
 async def health_check():
     """Report configuration state without exposing any secret material.
@@ -185,8 +245,11 @@ async def health_check():
     Lets a deploy be checked from a browser instead of by sending a chat and
     reading the failure.
     """
+    healthy = not anthropic_key_problem and engine_selftest["status"] in ("ok", "not run")
     return {
-        "status": "ok" if not anthropic_key_problem else "degraded",
+        "status": "ok" if healthy else "degraded",
+        "engine_selftest": engine_selftest["status"],
+        "engine_selftest_detail": engine_selftest["detail"],
         "version": APP_VERSION,
         "anthropic_key_configured": has_anthropic_credential,
         "anthropic_key_status": anthropic_key_problem or "ok",
