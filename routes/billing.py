@@ -1,3 +1,16 @@
+"""Stripe checkout and webhook endpoints.
+
+NOTE — unresolved schema mismatch. This module reads and writes the profiles
+column `compute_credits`, but the live chat path in main.py uses
+`credits_balance`. Only one of them matches the real Supabase table.
+
+Nothing breaks today because this router is never registered on the app (see
+main.py — there is no include_router call, and the pricing page deliberately
+stubs checkout out with "Pre-orders are not open yet"). Before wiring payments
+up, confirm the real column name and make both sides agree, or credits will be
+read from one column and written to the other.
+"""
+
 from fastapi import APIRouter, Request, HTTPException, Depends
 from fastapi.responses import JSONResponse
 import stripe

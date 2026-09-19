@@ -88,8 +88,20 @@ if anthropic_key_problem:
 anthropic_client = anthropic.Anthropic(api_key=anthropic_api_key or None)
 
 # Kept in one place so the tier router and the health probe cannot drift apart.
+#
+# The pro model always thinks and cannot be told not to, and thinking tokens
+# are output tokens billed against max_tokens. A 1024 budget therefore risks
+# being spent entirely on reasoning, returning an empty or cut-off reply on
+# harder questions. 4096 leaves room for the reasoning *and* the answer, and
+# "medium" effort keeps the reasoning spend bounded.
 PRO_MODEL = "claude-fable-5"
+PRO_MAX_TOKENS = 4096
+PRO_EFFORT = "medium"
+
+# The free model does not think, so it needs no extra headroom — and it
+# rejects the effort parameter outright, so it must not be sent one.
 FREE_MODEL = "claude-haiku-4-5"
+FREE_MAX_TOKENS = 1024
 
 ENGINE_UNAVAILABLE = (
     "The AI engine is not configured correctly. This is a server-side problem, "
@@ -128,10 +140,20 @@ def extract_reply(message: anthropic.types.Message) -> str:
             message.stop_reason,
             [block.type for block in message.content],
         )
+        if message.stop_reason == "max_tokens":
+            raise HTTPException(
+                status_code=502,
+                detail="That question needed more room than the engine had. Try asking it more simply.",
+            )
         raise HTTPException(
             status_code=502,
             detail="The engine returned an empty reply. Please try again.",
         )
+
+    if message.stop_reason == "max_tokens":
+        # Partial text beats no text, but record it — repeated hits mean the
+        # tier's token budget is set too low.
+        logger.warning("Reply truncated by max_tokens (%d chars returned)", len(text))
 
     return text
 
@@ -187,20 +209,29 @@ async def chat_endpoint(req: ChatRequest):
 
     if tier in ["pro", "ultra"]:
         active_model = PRO_MODEL
+        max_tokens = PRO_MAX_TOKENS
+        effort = PRO_EFFORT
         system_prompt = "You are a highly intelligent, elite digital twin. NEVER refer to yourself as an AI."
     else:
         active_model = FREE_MODEL
+        max_tokens = FREE_MAX_TOKENS
+        effort = None
         system_prompt = "You are a helpful digital twin. Keep responses concise. NEVER refer to yourself as an AI."
 
+    request_kwargs = {
+        "model": active_model,
+        "max_tokens": max_tokens,
+        "system": system_prompt,
+        "messages": [
+            {"role": "user", "content": req.message}
+        ],
+    }
+    # Only sent for the pro model; the free model errors on this parameter.
+    if effort:
+        request_kwargs["output_config"] = {"effort": effort}
+
     try:
-        ai_response = anthropic_client.messages.create(
-            model=active_model,
-            max_tokens=1024,
-            system=system_prompt,
-            messages=[
-                {"role": "user", "content": req.message}
-            ]
-        )
+        ai_response = anthropic_client.messages.create(**request_kwargs)
     except anthropic.AuthenticationError:
         # The 401 that produced "Anthropic Engine Error: Error code: 401".
         # The key is present but rejected: rotated, revoked, or from another org.
