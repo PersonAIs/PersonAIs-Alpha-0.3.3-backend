@@ -3,6 +3,6 @@ uvicorn
 pydantic
 python-dotenv
 supabase
-anthropic
+anthropic>=1,<2
 openai
 stripe
