@@ -36,9 +36,9 @@ logger = logging.getLogger("personais.social")
 # against it is the single most likely failure. It is named rather than left as
 # a 500, in the same spirit as the engine remedies on /api/health.
 MIGRATION_REMEDY = (
-    "The Alpha 0.4.4 social tables are missing from this Supabase project. Run the "
-    "SQL under 'Alpha 0.4.4 schema' in the backend README (Supabase → SQL Editor), "
-    "then try again."
+    "The Alpha 0.4.4 social tables are missing from this Supabase project. Run "
+    "migrations/0001_social_0.4.4.sql from the backend repo (Supabase dashboard → "
+    "SQL Editor → New query → paste → Run), then try again."
 )
 
 # Ambiguous characters are left out: a friend code gets read aloud and typed in
