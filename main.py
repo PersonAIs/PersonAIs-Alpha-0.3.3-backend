@@ -12,12 +12,14 @@ from dotenv import load_dotenv
 from supabase import create_client, Client
 import anthropic
 
+import social
+
 # 1. Load environment variables
 load_dotenv()
 
 logger = logging.getLogger("personais.engine")
 
-APP_VERSION = "0.4.3"
+APP_VERSION = "0.4.4"
 
 # Result of the boot-time self test, surfaced on /api/health.
 engine_selftest = {"status": "not run", "detail": None}
@@ -46,6 +48,10 @@ async def lifespan(_app: FastAPI):
     # not awaited: a slow API must never delay the port opening and fail the
     # hosting platform's own health check.
     asyncio.get_running_loop().run_in_executor(None, run_engine_selftest)
+    # Whether the 0.4.4 social tables exist is a property of the database, not
+    # of this process, so it is read once at boot and reported on /api/health
+    # rather than discovered by the first person who tries to add a friend.
+    asyncio.get_running_loop().run_in_executor(None, probe_social_schema)
     yield
 
 
@@ -363,20 +369,25 @@ class ChatRequest(BaseModel):
     message: str
 
 
-def build_request_kwargs(tier: str, message: str) -> dict:
-    """Build the exact request body a tier sends.
+def request_body(system: str, content: str, max_tokens: Optional[int] = None) -> dict:
+    """The exact request body this service sends, for any caller.
 
-    The boot self test calls this too, so a passing self test means the real
-    chat request is accepted — not merely that the credential works. Anything
-    that can be rejected (the model id, the token budget, the workspace id) is
-    exercised by both paths or by neither.
+    One builder for every path — the chat endpoint, the boot self test and the
+    twin turns in social.py — so that anything which can be rejected (the model
+    id, the token budget, the workspace id) is exercised by all of them or by
+    none of them.
     """
     return {
         "model": CHAT_MODEL,
-        "max_tokens": MAX_TOKENS,
-        "system": SYSTEM_PROMPTS.get(tier, SYSTEM_PROMPTS["free"]),
-        "messages": [{"role": "user", "content": message}],
+        "max_tokens": max_tokens or MAX_TOKENS,
+        "system": system,
+        "messages": [{"role": "user", "content": content}],
     }
+
+
+def build_request_kwargs(tier: str, message: str) -> dict:
+    """The request body for a chat message from a given tier."""
+    return request_body(SYSTEM_PROMPTS.get(tier, SYSTEM_PROMPTS["free"]), message)
 
 
 def extract_reply(message: anthropic.types.Message) -> str:
@@ -421,6 +432,195 @@ def extract_reply(message: anthropic.types.Message) -> str:
         logger.warning("Reply truncated by max_tokens (%d chars returned)", len(text))
 
     return text
+
+
+def generate_reply(system: str, content: str, max_tokens: Optional[int] = None) -> str:
+    """Send one message to the model and return the assistant's text.
+
+    Every provider failure mode is mapped here, once: a rejected key, a model
+    this key cannot serve, a malformed request, a rate limit, an unreachable
+    API. It used to live inside /api/chat, which was fine while chat was the
+    only caller — 0.4.4 added twin deliberation, and a second copy of this
+    ladder is a second place for the mapping to drift.
+
+    Raises HTTPException; never returns an error string, so nothing that calls
+    it can accidentally bill a credit for a failure.
+    """
+    if not has_anthropic_credential:
+        logger.error("Refusing to call the model: %s", anthropic_key_problem)
+        raise HTTPException(status_code=503, detail=ENGINE_UNAVAILABLE)
+
+    kwargs = request_body(system, content, max_tokens)
+    active_model = kwargs["model"]
+
+    # Boot already established this id is not servable, so the round trip can
+    # only end one way. Say which model, so the fix is obvious.
+    if model_status["status"] == "not served":
+        logger.error("Refusing to call the model: %s", model_status["detail"])
+        raise HTTPException(
+            status_code=502,
+            detail=misconfigured_detail(active_model, "this API key cannot serve that model"),
+        )
+
+    try:
+        response = anthropic_client.messages.create(**kwargs)
+    except anthropic.AuthenticationError:
+        # The 401 that produced "Anthropic Engine Error: Error code: 401".
+        # The key is present but rejected: rotated, revoked, or from another org.
+        logger.exception("Anthropic rejected the API key")
+        raise HTTPException(status_code=503, detail=ENGINE_UNAVAILABLE)
+    except anthropic.PermissionDeniedError:
+        logger.exception("Anthropic API key lacks permission for %s", active_model)
+        raise HTTPException(status_code=503, detail=ENGINE_UNAVAILABLE)
+    except anthropic.RateLimitError:
+        logger.warning("Anthropic rate limit hit on %s", active_model)
+        raise HTTPException(
+            status_code=429,
+            detail="The engine is busy right now. Give it a moment and try again.",
+        )
+    except anthropic.APIConnectionError:
+        logger.exception("Could not reach Anthropic")
+        raise HTTPException(
+            status_code=503,
+            detail="Could not reach the AI engine. Please try again in a moment.",
+        )
+    except anthropic.NotFoundError as e:
+        # This is what an unavailable model id looks like — the 0.4.1 failure.
+        logger.exception("Anthropic does not serve model %s for this key", active_model)
+        raise HTTPException(
+            status_code=502,
+            detail=misconfigured_detail(
+                active_model,
+                provider_message(e) or "no such model for this API key",
+            ),
+        )
+    except anthropic.BadRequestError as e:
+        # Malformed request: an unservable model id, a rejected parameter, or a
+        # key that is not scoped to a workspace and was sent without one.
+        logger.exception(
+            "Anthropic rejected the request for model %s (workspace id %s)",
+            active_model,
+            "set" if anthropic_workspace_id else "NOT set",
+        )
+        raise HTTPException(
+            status_code=502,
+            detail=misconfigured_detail(
+                active_model,
+                provider_message(e) or "the request was rejected as malformed",
+            ),
+        )
+    except anthropic.APIStatusError as e:
+        # Anything left is provider-side (5xx) and genuinely worth retrying.
+        logger.exception("Anthropic returned %s for model %s", e.status_code, active_model)
+        raise HTTPException(
+            status_code=502,
+            detail="The AI engine returned an error. Please try again in a moment.",
+        )
+
+    return extract_reply(response)
+
+
+# --- Who is calling ------------------------------------------------------
+#
+# /api/chat has always trusted the user_id in its body, which is survivable
+# while the only thing that id buys you is your own credit balance. Friends and
+# shared discussions are private to two people, so from 0.4.4 the social
+# endpoints resolve the caller from the Supabase access token instead and
+# ignore any id sent in the body.
+#
+# SOCIAL_REQUIRE_AUTH=off falls back to the body id. That is for local
+# development against a project with no auth set up; it makes every discussion
+# readable by anyone who can guess a uuid, so it must not be set in production.
+SOCIAL_REQUIRE_AUTH = clean_secret(
+    os.getenv("SOCIAL_REQUIRE_AUTH") or "on"
+).lower() not in ("0", "off", "false", "no")
+
+SESSION_EXPIRED = "Your session could not be verified. Sign out and sign in again."
+
+
+def bearer_token(authorization: Optional[str]) -> str:
+    """The token out of an 'Authorization: Bearer <token>' header."""
+    if not authorization:
+        return ""
+    parts = authorization.split(None, 1)
+    if len(parts) == 2 and parts[0].lower() == "bearer":
+        return parts[1].strip()
+    return ""
+
+
+def identify_user(authorization: Optional[str] = None,
+                  claimed_user_id: Optional[str] = None) -> str:
+    """Resolve the caller's user id, from their token where there is one."""
+    token = bearer_token(authorization)
+    if token:
+        try:
+            result = supabase.auth.get_user(token)
+        except Exception as e:
+            logger.warning("Rejected a session token: %s", type(e).__name__)
+            raise HTTPException(status_code=401, detail=SESSION_EXPIRED)
+        user = getattr(result, "user", None)
+        if user is None and isinstance(result, dict):
+            user = result.get("user")
+        user_id = getattr(user, "id", None)
+        if user_id is None and isinstance(user, dict):
+            user_id = user.get("id")
+        if not user_id:
+            raise HTTPException(status_code=401, detail=SESSION_EXPIRED)
+        return str(user_id)
+
+    if SOCIAL_REQUIRE_AUTH:
+        raise HTTPException(
+            status_code=401,
+            detail="This request carried no session. Sign in and try again.",
+        )
+    if not claimed_user_id or claimed_user_id == "guest_tester":
+        raise HTTPException(
+            status_code=401,
+            detail="Friends and shared discussions need a signed-in account.",
+        )
+    return claimed_user_id
+
+
+# --- Social feature configuration ----------------------------------------
+#
+# A deliberation round is one turn from each twin and costs each of them one
+# credit, so a balance is what actually stops a pair of twins that will not
+# agree. The cap is a backstop against a large balance and an endless argument;
+# the per-request limit keeps one HTTP call short enough to survive a proxy.
+DELIBERATION_ROUND_CAP = positive_int("DELIBERATION_ROUND_CAP", 50)
+DELIBERATION_ROUNDS_PER_REQUEST = positive_int("DELIBERATION_ROUNDS_PER_REQUEST", 1)
+TWIN_MAX_TOKENS = positive_int("TWIN_MAX_TOKENS", 512)
+
+# Whether this database has had the 0.4.4 migration run against it. Surfaced on
+# /api/health next to the engine checks.
+social_status = {"status": "not run", "detail": None}
+
+
+def probe_social_schema() -> None:
+    """Check the 0.4.4 tables exist, and say which migration to run if not."""
+    if not (supabase_url and supabase_key):
+        social_status.update(status="unknown", detail="Supabase is not configured")
+        return
+    try:
+        # The second read covers a half-applied migration: the tables can exist
+        # from an earlier attempt while the column the verdict loop writes does
+        # not.
+        supabase.table("friendships").select("id").limit(1).execute()
+        supabase.table("conversation_members").select("verdict_note").limit(1).execute()
+    except Exception as e:
+        if social.looks_like_missing_schema(e):
+            social_status.update(status="missing", detail=social.MIGRATION_REMEDY)
+            logger.error("Social schema missing — %s", e)
+            print(f"🛑 CRITICAL ERROR: {social.MIGRATION_REMEDY}")
+        else:
+            social_status.update(
+                status="unknown",
+                detail=f"{type(e).__name__} reading the social tables",
+            )
+            logger.warning("Could not verify the social schema: %s", type(e).__name__)
+        return
+    social_status.update(status="ready", detail=None)
+    logger.info("Social schema is present")
 
 
 # One short message per boot. Set ENGINE_SELFTEST=off to skip it.
@@ -490,6 +690,10 @@ async def health_check():
         not anthropic_key_problem
         and model_status["status"] != "not served"
         and engine_selftest["status"] != "failed"
+        # Friends and shared discussions are part of this release, so a
+        # database that never had the migration run is a degraded deploy even
+        # though one-to-one chat still works on it.
+        and social_status["status"] != "missing"
     )
     return {
         "status": "ok" if healthy else "degraded",
@@ -507,6 +711,9 @@ async def health_check():
         "anthropic_key_status": anthropic_key_problem or "ok",
         "anthropic_workspace_id_set": bool(anthropic_workspace_id),
         "supabase_configured": bool(supabase_url and supabase_key),
+        "social_schema": social_status["status"],
+        "social_remedy": social_status["detail"],
+        "social_auth_required": SOCIAL_REQUIRE_AUTH,
         # Every tier shares one model until a pro model is available on this
         # key; kept in the response so the routing is visible, not implied.
         "models": {"free": CHAT_MODEL, "pro": CHAT_MODEL},
@@ -549,74 +756,11 @@ async def chat_endpoint(req: ChatRequest):
     # The tier still selects the persona, but every tier uses the one model
     # this API key is known to serve.
     request_tier = "pro" if tier in ["pro", "ultra"] else "free"
-    request_kwargs = build_request_kwargs(request_tier, req.message)
-    active_model = request_kwargs["model"]
-
-    # Boot already established this id is not servable, so the round trip can
-    # only end one way. Say which model, so the fix is obvious.
-    if model_status["status"] == "not served":
-        logger.error("Refusing chat: %s", model_status["detail"])
-        raise HTTPException(
-            status_code=502,
-            detail=misconfigured_detail(active_model, "this API key cannot serve that model"),
-        )
-
-    try:
-        ai_response = anthropic_client.messages.create(**request_kwargs)
-    except anthropic.AuthenticationError:
-        # The 401 that produced "Anthropic Engine Error: Error code: 401".
-        # The key is present but rejected: rotated, revoked, or from another org.
-        logger.exception("Anthropic rejected the API key")
-        raise HTTPException(status_code=503, detail=ENGINE_UNAVAILABLE)
-    except anthropic.PermissionDeniedError:
-        logger.exception("Anthropic API key lacks permission for %s", active_model)
-        raise HTTPException(status_code=503, detail=ENGINE_UNAVAILABLE)
-    except anthropic.RateLimitError:
-        logger.warning("Anthropic rate limit hit on %s", active_model)
-        raise HTTPException(
-            status_code=429,
-            detail="The engine is busy right now. Give it a moment and try again.",
-        )
-    except anthropic.APIConnectionError:
-        logger.exception("Could not reach Anthropic")
-        raise HTTPException(
-            status_code=503,
-            detail="Could not reach the AI engine. Please try again in a moment.",
-        )
-    except anthropic.NotFoundError as e:
-        # This is what an unavailable model id looks like — the 0.4.1 failure.
-        logger.exception("Anthropic does not serve model %s for this key", active_model)
-        raise HTTPException(
-            status_code=502,
-            detail=misconfigured_detail(
-                active_model,
-                provider_message(e) or "no such model for this API key",
-            ),
-        )
-    except anthropic.BadRequestError as e:
-        # Malformed request: an unservable model id, a rejected parameter, or a
-        # key that is not scoped to a workspace and was sent without one.
-        logger.exception(
-            "Anthropic rejected the request for model %s (workspace id %s)",
-            active_model,
-            "set" if anthropic_workspace_id else "NOT set",
-        )
-        raise HTTPException(
-            status_code=502,
-            detail=misconfigured_detail(
-                active_model,
-                provider_message(e) or "the request was rejected as malformed",
-            ),
-        )
-    except anthropic.APIStatusError as e:
-        # Anything left is provider-side (5xx) and genuinely worth retrying.
-        logger.exception("Anthropic returned %s for model %s", e.status_code, active_model)
-        raise HTTPException(
-            status_code=502,
-            detail="The AI engine returned an error. Please try again in a moment.",
-        )
-
-    reply_text = extract_reply(ai_response)
+    active_model = CHAT_MODEL
+    reply_text = generate_reply(
+        system=SYSTEM_PROMPTS.get(request_tier, SYSTEM_PROMPTS["free"]),
+        content=req.message,
+    )
 
     new_balance = current_credits - 1
     if req.user_id != "guest_tester":
@@ -627,3 +771,24 @@ async def chat_endpoint(req: ChatRequest):
         "model_used": active_model,
         "remaining_credits": new_balance
     }
+
+
+# --- Friends and shared discussions (0.4.4) ------------------------------
+#
+# The router is built with its dependencies rather than importing them, which
+# keeps social.py free of module-level state and — because these are callables
+# resolved per request — means a test that swaps out the Supabase client or the
+# model call sees that swap on the social endpoints too.
+app.include_router(
+    social.build_social_router(
+        db=lambda: supabase,
+        generate=lambda system, content, max_tokens=None: generate_reply(
+            system=system, content=content, max_tokens=max_tokens
+        ),
+        identify=identify_user,
+        round_cap=DELIBERATION_ROUND_CAP,
+        rounds_per_request=DELIBERATION_ROUNDS_PER_REQUEST,
+        twin_max_tokens=TWIN_MAX_TOKENS,
+    ),
+    prefix="/api",
+)
