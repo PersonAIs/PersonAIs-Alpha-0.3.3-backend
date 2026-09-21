@@ -41,68 +41,43 @@ Two limits sit above that, both settable from the dashboard:
   that will never converge and a balance large enough to prove it. Credits are
   the intended stop; this is the backstop.
 
-### Alpha 0.4.4 schema
+### Alpha 0.4.4 schema — run this before anything else
 
-**This migration has to be run before friends will work.** Supabase → SQL
-Editor → paste → run. `/api/health` reports `social_schema` so you can check it
-took.
+**Friends and discussions answer `503` until this migration has been run.**
+The whole thing is one file in this repo:
 
-```sql
--- PersonAIs Alpha 0.4.4 — friends, discussions and twin deliberation.
-alter table public.profiles add column if not exists display_name text;
-alter table public.profiles add column if not exists friend_code  text;
-alter table public.profiles add column if not exists twin_brief   text;
-create unique index if not exists profiles_friend_code_key
-  on public.profiles (friend_code);
+    migrations/0001_social_0.4.4.sql
 
-create table if not exists public.friendships (
-  id           uuid primary key default gen_random_uuid(),
-  requester_id uuid not null references public.profiles(id) on delete cascade,
-  addressee_id uuid not null references public.profiles(id) on delete cascade,
-  status       text not null default 'pending'
-               check (status in ('pending', 'accepted', 'declined')),
-  created_at   timestamptz not null default now(),
-  responded_at timestamptz,
-  check (requester_id <> addressee_id),
-  unique (requester_id, addressee_id)
-);
+1. Open that file and copy all of it.
+2. Supabase dashboard → your project → **SQL Editor** → **New query**.
+3. Paste, press **Run** (or ⌘/Ctrl + Enter).
+4. It prints a four-row table — `conversation_members`, `conversation_messages`,
+   `conversations`, `friendships` — which is your confirmation.
+5. Reload `GET /api/health`: `"social_schema"` should now read `"ready"`.
 
-create table if not exists public.conversations (
-  id               uuid primary key default gen_random_uuid(),
-  topic            text not null,
-  created_by       uuid not null references public.profiles(id) on delete cascade,
-  mode             text not null default 'manual' check (mode in ('manual', 'auto')),
-  status           text not null default 'open'
-                   check (status in ('open', 'deliberating', 'resolved', 'exhausted')),
-  round            integer not null default 0,
-  current_proposal text,
-  stop_reason      text,
-  created_at       timestamptz not null default now(),
-  updated_at       timestamptz not null default now()
-);
+No restart is needed; the service picks the tables up on the next request, and
+the boot probe re-reads them on the next deploy.
 
-create table if not exists public.conversation_members (
-  conversation_id uuid not null references public.conversations(id) on delete cascade,
-  user_id         uuid not null references public.profiles(id) on delete cascade,
-  verdict         text not null default 'pending'
-                  check (verdict in ('pending', 'agree', 'disagree')),
-  verdict_round   integer,
-  verdict_note    text,
-  primary key (conversation_id, user_id)
-);
+What it changes:
 
-create table if not exists public.conversation_messages (
-  id              uuid primary key default gen_random_uuid(),
-  conversation_id uuid not null references public.conversations(id) on delete cascade,
-  user_id         uuid references public.profiles(id) on delete set null,
-  author          text not null check (author in ('human', 'twin', 'system')),
-  round           integer not null default 0,
-  content         text not null,
-  created_at      timestamptz not null default now()
-);
-create index if not exists conversation_messages_thread_idx
-  on public.conversation_messages (conversation_id, created_at);
-```
+| Object | Change |
+| ------ | ------ |
+| `profiles` | Three new **nullable** columns — `display_name`, `friend_code`, `twin_brief` — plus a unique index on `friend_code`. Existing rows and columns are untouched. |
+| `friendships` | New. One row per pair, `pending` / `accepted` / `declined`, with a check that nobody befriends themselves. |
+| `conversations` | New. Topic, mode, status, round counter and the proposal currently on the table. |
+| `conversation_members` | New. Who is in a discussion and how they voted on the current proposal. |
+| `conversation_messages` | New. The transcript — typed messages and twin turns in one table. |
+
+It is safe to run twice: every statement is `if not exists`, and nothing in it
+drops, alters or reads existing data. It was applied against a stock
+PostgreSQL 16 before release, then re-run to confirm the second run is a no-op,
+and its constraints were checked one by one (duplicate friend code rejected,
+self-friendship rejected, the same pair twice rejected, an invented verdict
+rejected, deleting a discussion taking its transcript with it).
+
+If step 3 fails with `relation "public.profiles" does not exist`, the SQL
+Editor is pointed at the wrong project — the digital-twin alpha's `profiles`
+table has to be there already, since friendships reference it.
 
 Row-level security is not part of this migration. Nothing in the browser
 touches these tables directly — every read and write goes through this service
