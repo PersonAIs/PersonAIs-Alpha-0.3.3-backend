@@ -1,9 +1,108 @@
-# PersonAIs — Backend Engine (Alpha 0.4.4)
+# PersonAIs — Backend Engine (Alpha 0.4.5)
 
 FastAPI service behind the PersonAIs digital-twin alpha. It serves one-to-one
 chat with your own twin (`POST /api/chat`), a full configuration read-out you
-can open in a browser (`GET /api/health`), and — new in 0.4.4 — friends and
-twin-to-twin discussions under `/api/social`.
+can open in a browser (`GET /api/health`), and friends and twin-to-twin
+discussions under `/api/social` — which, since 0.4.5, come with a daily limit.
+
+## What's new in 0.4.5 — a daily limit on twin discussions
+
+Twins that will not agree used to keep going until a balance was empty: one
+"Let them settle it", or one objection, could spend every credit an account
+had in a single sitting. Now **each person may spend up to three credits a day
+on twin rounds**.
+
+- A round costs each side one credit, so three credits is **three rounds a
+  day for each of you**, across every discussion you are in.
+- The day is the **UTC calendar day**. The allowance comes back at midnight
+  UTC for everybody at once, and a room the limit stopped reopens by itself —
+  nobody has to press anything.
+- It works exactly like a balance: a round needs one credit of allowance from
+  **each** participant, so whoever has less left today decides how many
+  rounds can run. The twins stop with `daily_limit`, and both of you see
+  *"One of you has used today's 3 discussion credits, so the twins have
+  stopped for the day. They can carry on after the reset at midnight UTC."*
+- The balance still has to cover each round. The allowance only caps how fast
+  it can be spent; it never adds credits.
+- **Typing stays free and unlimited**, and one-to-one chat (`/api/chat`) is not
+  touched.
+
+When more than one thing stops the twins, the permanent reason is named
+first — an empty balance, then the round cap, then the daily limit — so the
+engine never tells anybody to wait for midnight when midnight will not help.
+
+### How it is counted
+
+Every credit a twin turn spends is a row in `discussion_usage` (who, which
+discussion, which round, when). Today's usage is the sum of your rows since
+midnight UTC. Nothing is reset at midnight — yesterday's rows simply stop
+counting — so there is no job to schedule and no counter to drift. The rows
+are written only after the model has answered, like the charge itself: a
+failed turn costs neither a credit nor any allowance.
+
+### Setting it
+
+`DISCUSSION_DAILY_CREDIT_LIMIT` (default `3`):
+
+| Value | Means |
+| ----- | ----- |
+| `3`, `5`, … | That many credits per person per UTC day. |
+| `0` | Twin rounds are paused for everybody — a way to stop the spending without a deploy. Typing carries on. |
+| `off` | No daily limit, and nothing is written to `discussion_usage`. The 0.4.4 behaviour. |
+
+Anything else (a typo, a negative number) keeps the default and says so in the
+deploy log: a mistyped setting must never quietly remove a spending limit.
+
+### Alpha 0.4.5 schema — run this after 0.4.4's
+
+**Twin rounds answer `503` until this migration has been run.** Everything
+else — friends, reading and typing in discussions, voting — keeps working
+without it; the engine only refuses the one thing it cannot count.
+
+    migrations/0002_discussion_limits_0.4.5.sql
+
+1. If this project never had `0001_social_0.4.4.sql` run, run that first.
+2. Open `0002_discussion_limits_0.4.5.sql` and copy all of it.
+3. Supabase dashboard → your project → **SQL Editor** → **New query**.
+4. Paste, press **Run** (or ⌘/Ctrl + Enter).
+5. It prints one row — `discussion_usage` with `6` columns — as confirmation.
+6. Reload `GET /api/health`: `"limits_schema"` should now read `"ready"`.
+
+It adds one table, `discussion_usage`, and one index on
+`(user_id, created_at)`; no existing table or row is touched. It is safe to
+run twice. Before release it was applied to a stock PostgreSQL 16 after
+`0001`, both files were re-run to confirm the second run is a no-op, and each
+rule was checked: a zero or negative charge is rejected, so is a row for a
+person who does not exist; deleting a discussion **keeps** its usage rows (so
+deleting a room cannot hand back today's credits) while deleting a person
+removes theirs; and the engine's own query counts from midnight UTC correctly
+for rows written with any timezone offset.
+
+### What the API says about it
+
+Every discussion (`GET /api/social/conversations/{id}`, the list, and each
+action's response) now carries:
+
+| Field | Meaning |
+| ----- | ------- |
+| `daily_limit` | The configured allowance, or `null` when it is off. |
+| `my_daily_left`, `partner_daily_left` | What each of you may still spend today. `null` when there is no limit, or when it could not be counted. |
+| `daily_resets_at` | The next midnight UTC, as an ISO timestamp. |
+| `can_deliberate` | Now also `false` when either side has no allowance left. |
+| `blocked_reason`, `blocked_detail` | Why another round cannot run **right now** (`credits_exhausted`, `round_cap` or `daily_limit`) and the sentence to show. `stop_reason` still records why the twins last stopped. |
+
+`GET /api/social/me`, `GET /api/social/friends` and `GET
+/api/social/conversations` also return your own allowance:
+
+```json
+"usage": {"daily_limit": 3, "used_today": 1, "left_today": 2,
+          "resets_at": "2026-09-27T00:00:00+00:00"}
+```
+
+A discussion that stopped on the limit is stored as `exhausted`, but reads
+back as `deliberating` (or `open`) as soon as the budget is back — a new day,
+or a top-up after `credits_exhausted` — so a list never shows a room as stuck
+when it is not.
 
 ## What's new in 0.4.4 — friends, and twins that argue for you
 
@@ -40,6 +139,9 @@ Two limits sit above that, both settable from the dashboard:
 - `DELIBERATION_ROUND_CAP` (default 50) — a runaway guard for a pair of twins
   that will never converge and a balance large enough to prove it. Credits are
   the intended stop; this is the backstop.
+
+Since 0.4.5 there is a third: the daily allowance described above, which is
+now what usually ends an argument first.
 
 ### Alpha 0.4.4 schema — run this before anything else
 
@@ -233,6 +335,7 @@ working:
 | `DELIBERATION_ROUND_CAP` | no       | `50`                          | Runaway guard on rounds in one discussion. Credits are the intended stop. |
 | `DELIBERATION_ROUNDS_PER_REQUEST` | no | `1`                        | Rounds a single HTTP call may run. Raise it to trade live progress for fewer round trips. |
 | `TWIN_MAX_TOKENS`        | no       | `512`                         | Budget for one twin turn. Twin turns are capped at ~110 words, so this is generous. |
+| `DISCUSSION_DAILY_CREDIT_LIMIT` | no | `3`                          | Credits each person may spend on twin rounds per UTC day. `0` pauses twin rounds; `off` removes the limit. See [Setting it](#setting-it). |
 
 ## Run locally
 
@@ -267,7 +370,7 @@ unreachable API delays neither the port nor the platform's health check.
 
 ## After deploying: what to check
 
-1. **`GET /api/health` — `"version"` must read `0.4.4`.** If it says anything
+1. **`GET /api/health` — `"version"` must read `0.4.5`.** If it says anything
    older, the new code is not live and nothing below means anything.
 2. **`"status": "ok"`.** It is only `ok` when the key is usable, the model id
    is one this key can serve, *and* the boot message got a real answer back.
@@ -293,6 +396,10 @@ unreachable API delays neither the port nor the platform's health check.
    has not been run against this project — friends and discussions will answer
    `503` until it is, and `social_remedy` says so. `unknown` only means the
    check itself could not run (usually Supabase is unconfigured).
+9. **`"limits_schema": "ready"`** and **`"discussion_daily_credit_limit": 3`**.
+   `missing` means the 0.4.5 migration has not been run — twin rounds answer
+   `503` until it is, and `limits_remedy` names the file. `off` means
+   `DISCUSSION_DAILY_CREDIT_LIMIT=off`, and then the limit is `null`.
 
 If the self test fails, `engine_selftest_detail` carries the HTTP status and
 the provider's own sentence. The deploy log has the same line prefixed `🛑`.
@@ -313,6 +420,9 @@ the provider's own sentence. The deploy log has the same line prefixed `🛑`.
 | `social_schema: missing`, or a `503` naming "Alpha 0.4.4" | The migration has not been run on this project. Run it, then restart. |
 | A discussion answers `409 … moved on`                     | The other participant's browser already ran that round. Reload. |
 | The twins stop with `credits_exhausted`                   | Working as designed — a round costs both sides a credit. Top up to continue. |
+| The twins stop with `daily_limit`                         | Working as designed — one of you has used today's allowance. It comes back at midnight UTC and the room reopens by itself. |
+| `limits_schema: missing`, or a `503` naming "Alpha 0.4.5" | The 0.4.5 migration has not been run. Run `migrations/0002_discussion_limits_0.4.5.sql`; no restart needed. |
+| Every twin round stops at once with "paused on this server" | `DISCUSSION_DAILY_CREDIT_LIMIT` is `0`. Set a number, or `off`, and restart. |
 
 ## Known alpha limitations
 
@@ -324,7 +434,13 @@ the provider's own sentence. The deploy log has the same line prefixed `🛑`.
   caught by `expected_round`, but the check and the charge are separate
   statements, so a genuinely concurrent pair could still slip past and charge
   two rounds. Credit balances are read-modify-write for the same reason, here
-  and in `/api/chat`.
+  and in `/api/chat`. The daily allowance shares the gap: rounds started at
+  the same instant in two *different* discussions can each pass the check, so
+  a person can end a day over their allowance by as many rounds as they
+  started at once. Closing it needs the check and the
+  charge in one database function, which is the same fix for all three.
+- **One daily allowance for every tier.** Pro and Ultra accounts get the same
+  three credits a day as free ones; there is one setting, not one per tier.
 - **A twin discussion is two people only.** The schema would carry more, but
   the round structure (one turn each, alternating opener) assumes two.
 - There is no pro-tier model. Every paying tier is served by the same model as

@@ -32,7 +32,7 @@ def check(name, got, want):
 
 def load(api_key=VALID_KEY, auth_token=None, workspace_id=None,
          model=None, max_tokens=None, social_auth="off", round_cap=None,
-         rounds_per_request=None):
+         rounds_per_request=None, daily_limit=None):
     """Import main.py fresh with a given environment.
 
     Social endpoints default to SOCIAL_REQUIRE_AUTH=off here so that most tests
@@ -47,7 +47,8 @@ def load(api_key=VALID_KEY, auth_token=None, workspace_id=None,
                        ("CHAT_MAX_TOKENS", max_tokens),
                        ("SOCIAL_REQUIRE_AUTH", social_auth),
                        ("DELIBERATION_ROUND_CAP", round_cap),
-                       ("DELIBERATION_ROUNDS_PER_REQUEST", rounds_per_request)):
+                       ("DELIBERATION_ROUNDS_PER_REQUEST", rounds_per_request),
+                       ("DISCUSSION_DAILY_CREDIT_LIMIT", daily_limit)):
         if value is None:
             os.environ.pop(var, None)
         else:
@@ -420,9 +421,20 @@ os.environ.pop("ENGINE_SELFTEST")
 # and a scripted model, so a round of twin deliberation can be run — and its
 # credit arithmetic checked — without a database or an API key.
 import uuid  # noqa: E402
+from datetime import datetime, timedelta, timezone  # noqa: E402
 
 import deliberation  # noqa: E402
 import social  # noqa: E402
+
+
+def as_time(value):
+    """A timestamp cell or filter value as a datetime, for range filters."""
+    if isinstance(value, datetime):
+        return value
+    try:
+        return datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError:
+        return None
 
 
 class FakeQuery:
@@ -457,6 +469,10 @@ class FakeQuery:
         self.filters.append(("ilike", column, pattern))
         return self
 
+    def gte(self, column, value):
+        self.filters.append(("gte", column, value))
+        return self
+
     def order(self, column, desc=False):
         self.order_by = (column, desc)
         return self
@@ -475,6 +491,12 @@ class FakeQuery:
             if kind == "ilike":
                 needle = str(value).replace("%", "").lower()
                 if not str(cell or "").lower().startswith(needle):
+                    return False
+            if kind == "gte":
+                # Compared as times, not strings: '+00:00' and 'Z' are the
+                # same instant and would sort differently as text.
+                cell_time, bound = as_time(cell), as_time(value)
+                if cell_time is None or bound is None or cell_time < bound:
                     return False
         return True
 
@@ -988,6 +1010,280 @@ capture(main, reply([text_block("still here")]))
 check("one-to-one chat still works for a guest",
       TestClient(main.app).post("/api/chat",
                                 json={"user_id": "guest_tester", "message": "hi"}).status_code, 200)
+
+# --- the daily discussion allowance (0.4.5) -------------------------------
+#
+# Each person may spend DISCUSSION_DAILY_CREDIT_LIMIT credits a UTC day on twin
+# rounds (three by default). The clock is moved by swapping main.now_utc, which
+# the router looks up on every request.
+def pin_clock(module, moment):
+    clock = {"now": moment}
+    module.now_utc = lambda: clock["now"]
+    return clock
+
+
+def deliberate(client, conversation_id, user_id="user-a"):
+    return client.post(f"/api/social/conversations/{conversation_id}/deliberate",
+                       json={"user_id": user_id})
+
+
+def read(client, conversation_id, user_id="user-a"):
+    return client.get(f"/api/social/conversations/{conversation_id}?user_id={user_id}")
+
+
+# The policy on its own.
+check("a daily allowance caps rounds the way a balance does",
+      deliberation.affordable_rounds([9, 9], 5, 50, [2, 3]), (2, None))
+check("the smaller allowance sets the limit",
+      deliberation.affordable_rounds([9, 9], 5, 50, [3, 1]), (1, None))
+check("a spent allowance stops the twins",
+      deliberation.affordable_rounds([9, 9], 1, 50, [0, 3]), (0, "daily_limit"))
+check("no daily limit is not the same as none left",
+      deliberation.affordable_rounds([9, 9], 1, 50, None), (1, None))
+check("an empty balance is named before the daily limit — tomorrow will not fix it",
+      deliberation.affordable_rounds([0, 9], 1, 50, [0, 0]), (0, "credits_exhausted"))
+check("so is the round cap",
+      deliberation.affordable_rounds([9, 9], 1, 0, [0, 0]), (0, "round_cap"))
+check("a spent allowance means no next round",
+      deliberation.can_continue([9, 9], 50, "deliberating", [1, 0]), False)
+check("an allowance never goes below zero", deliberation.allowance_left(5, 3), 0)
+check("with no limit there is no allowance to count", deliberation.allowance_left(5, None), None)
+
+day_start, day_reset = deliberation.day_window(datetime(2026, 9, 26, 23, 59, tzinfo=timezone.utc))
+check("a day starts at midnight UTC", day_start.isoformat(), "2026-09-26T00:00:00+00:00")
+check("and resets at the next one", day_reset.isoformat(), "2026-09-27T00:00:00+00:00")
+check("a time in another zone is counted in UTC",
+      deliberation.day_window(
+          datetime(2026, 9, 27, 1, 0, tzinfo=timezone(timedelta(hours=5))))[0].isoformat(),
+      "2026-09-26T00:00:00+00:00")
+
+check("the stop line names the allowance",
+      "today's 3 discussion credits" in deliberation.stop_message("daily_limit", 3), True)
+check("the stop line says when it comes back",
+      "midnight UTC" in deliberation.stop_message("daily_limit", 3), True)
+check("one credit is singular",
+      "today's 1 discussion credit," in deliberation.stop_message("daily_limit", 1), True)
+check("a limit of zero reads as paused, not as spent",
+      deliberation.stop_message("daily_limit", 0), deliberation.ROUNDS_PAUSED)
+
+# The setting.
+check("the daily limit defaults to three", load().DISCUSSION_DAILY_CREDIT_LIMIT, 3)
+check("the daily limit is settable", load(daily_limit="5").DISCUSSION_DAILY_CREDIT_LIMIT, 5)
+check("'off' removes the daily limit",
+      load(daily_limit="off").DISCUSSION_DAILY_CREDIT_LIMIT, None)
+check("zero is a limit of zero, not no limit",
+      load(daily_limit="0").DISCUSSION_DAILY_CREDIT_LIMIT, 0)
+check("a typo keeps the limit on", load(daily_limit="lots").DISCUSSION_DAILY_CREDIT_LIMIT, 3)
+check("a negative limit keeps the default",
+      load(daily_limit="-2").DISCUSSION_DAILY_CREDIT_LIMIT, 3)
+check("a quoted limit is read", load(daily_limit='"4"\n').DISCUSSION_DAILY_CREDIT_LIMIT, 4)
+
+# Three rounds a day, then the twins stop until tomorrow.
+main = load()
+client = TestClient(main.app, raise_server_exceptions=False)
+db = social_db()  # twenty credits each: the allowance, not the balance, is the stop
+main.supabase = db
+befriend(db)
+clock = pin_clock(main, datetime(2026, 9, 26, 15, 0, tzinfo=timezone.utc))
+conversation_id = start_discussion(client).json()["conversation"]["id"]
+
+opened = read(client, conversation_id).json()["conversation"]
+check("a new discussion shows each side's full allowance",
+      (opened["daily_limit"], opened["my_daily_left"], opened["partner_daily_left"]), (3, 3, 3))
+check("and when it resets", opened["daily_resets_at"], "2026-09-27T00:00:00+00:00")
+check("nothing is blocking the twins yet",
+      (opened["can_deliberate"], opened["blocked_reason"]), (True, None))
+
+calls = script(main, [f"turn {n}" for n in range(1, 7)])
+rounds = [deliberate(client, conversation_id).json() for _ in range(3)]
+third = rounds[-1]
+check("three rounds run in a day", third["conversation"]["round"], 3)
+check("each side paid for its own three turns",
+      (db.credits("user-a"), db.credits("user-b")), (17, 17))
+check("the allowance counts down as the rounds land",
+      [r["conversation"]["my_daily_left"] for r in rounds], [2, 1, 0])
+check("the third round is the last one today", third["can_continue"], False)
+check("the twins say why they stopped", third["stop_reason"], "daily_limit")
+check("a discussion stopped for the day is marked as stopped",
+      third["conversation"]["status"], "exhausted")
+check("the transcript tells both of you",
+      "today's 3 discussion credits" in third["messages"][-1]["content"], True)
+check("the room shows nothing left for either side",
+      (third["conversation"]["my_daily_left"], third["conversation"]["partner_daily_left"]),
+      (0, 0))
+check("the room says why another round cannot run",
+      (third["conversation"]["blocked_reason"],
+       "midnight UTC" in (third["conversation"]["blocked_detail"] or "")),
+      ("daily_limit", True))
+
+model_calls = len(calls)
+fourth = deliberate(client, conversation_id).json()
+check("a fourth round the same day runs nothing", fourth["rounds_run"], 0)
+check("it charges nobody", (db.credits("user-a"), db.credits("user-b")), (17, 17))
+check("and never reaches the model", len(calls), model_calls)
+check("asking again does not repeat the stop line", fourth["messages"], [])
+
+ledger = db.rows("discussion_usage")
+check("every credit spent is on the ledger", len(ledger), 6)
+check("half of it is each side's",
+      sorted(row["user_id"] for row in ledger), ["user-a"] * 3 + ["user-b"] * 3)
+check("a ledger row names the discussion and the round",
+      {(row["conversation_id"], row["round"]) for row in ledger},
+      {(conversation_id, 1), (conversation_id, 2), (conversation_id, 3)})
+check("a ledger row is stamped with the allowance clock",
+      ledger[0]["created_at"] if ledger else None, "2026-09-26T15:00:00+00:00")
+
+listing = client.get("/api/social/conversations?user_id=user-a").json()
+check("the list reports today's usage", listing["usage"], {
+    "daily_limit": 3, "used_today": 3, "left_today": 0,
+    "resets_at": "2026-09-27T00:00:00+00:00"})
+check("the list says why the room is stuck",
+      listing["conversations"][0]["blocked_reason"], "daily_limit")
+check("your card carries the allowance too",
+      client.get("/api/social/me?user_id=user-a").json()["usage"]["left_today"], 0)
+check("so does your network page",
+      client.get("/api/social/friends?user_id=user-b").json()["usage"]["used_today"], 3)
+check("typing is still free when the allowance is gone",
+      client.post(f"/api/social/conversations/{conversation_id}/messages",
+                  json={"user_id": "user-a", "content": "Let's pick this up tomorrow."}
+                  ).status_code, 200)
+
+# A minute before midnight is still today.
+clock["now"] = datetime(2026, 9, 26, 23, 59, tzinfo=timezone.utc)
+check("the allowance holds until midnight UTC",
+      read(client, conversation_id).json()["conversation"]["my_daily_left"], 0)
+
+# Midnight UTC: yesterday's rows stop counting, and nothing had to be reset.
+clock["now"] = datetime(2026, 9, 27, 0, 0, 30, tzinfo=timezone.utc)
+fresh = read(client, conversation_id).json()["conversation"]
+check("the allowance comes back at midnight UTC",
+      (fresh["my_daily_left"], fresh["partner_daily_left"]), (3, 3))
+check("a new day reopens the discussion", fresh["can_deliberate"], True)
+check("a room stopped only for the day is not shown as stopped",
+      (fresh["status"], fresh["stop_reason"], fresh["blocked_reason"]),
+      ("deliberating", None, None))
+check("the next reset moves on a day", fresh["daily_resets_at"], "2026-09-28T00:00:00+00:00")
+next_day = deliberate(client, conversation_id).json()
+check("the twins pick up where they left off", next_day["conversation"]["round"], 4)
+check("and today's allowance is what pays for it",
+      next_day["conversation"]["my_daily_left"], 2)
+check("yesterday's ledger is kept, not wiped", len(db.rows("discussion_usage")), 8)
+
+# The allowance is one person's, across every discussion they are in.
+main = load()
+client = TestClient(main.app, raise_server_exceptions=False)
+db = social_db()
+db.rows("profiles").append({"id": "user-c", "display_name": "Cleo", "friend_code": "PA-CCCCCC",
+                            "subscription_tier": "free", "credits_balance": 20})
+main.supabase = db
+befriend(db)
+befriend(db, b="user-c")
+pin_clock(main, datetime(2026, 9, 26, 9, 0, tzinfo=timezone.utc))
+with_ben = start_discussion(client, "Offsite").json()["conversation"]["id"]
+with_cleo = client.post("/api/social/conversations", json={
+    "user_id": "user-a", "friend_id": "user-c", "topic": "Book club", "mode": "auto",
+}).json()["conversation"]["id"]
+calls = script(main, [])
+deliberate(client, with_ben)
+deliberate(client, with_ben)
+elsewhere = read(client, with_cleo).json()["conversation"]
+check("rounds in one discussion count against the others",
+      (elsewhere["my_daily_left"], elsewhere["partner_daily_left"]), (1, 3))
+last = deliberate(client, with_cleo).json()
+check("the rest of the allowance can be spent anywhere", last["rounds_run"], 1)
+check("and then it is gone everywhere", last["stop_reason"], "daily_limit")
+check("the friend pays for the round that ran and keeps the rest of their allowance",
+      (db.credits("user-c"), last["conversation"]["partner_daily_left"]), (19, 2))
+
+# Either side out of today's allowance stops the round: it needs a turn from each.
+model_calls = len(calls)
+cleo_asks = deliberate(client, with_cleo, user_id="user-c").json()
+check("a round needs both sides to have allowance left", cleo_asks["rounds_run"], 0)
+check("nobody is charged for it", (db.credits("user-a"), db.credits("user-c")), (17, 19))
+check("and the model is never called", len(calls), model_calls)
+check("the other side sees why",
+      cleo_asks["conversation"]["blocked_reason"], "daily_limit")
+
+# 'off' removes the cap, and with it the ledger.
+main = load(daily_limit="off")
+client = TestClient(main.app, raise_server_exceptions=False)
+db = social_db()
+main.supabase = db
+befriend(db)
+conversation_id = start_discussion(client).json()["conversation"]["id"]
+script(main, [])
+uncapped = [deliberate(client, conversation_id).json() for _ in range(4)]
+check("with the limit off a fourth round runs", uncapped[-1]["conversation"]["round"], 4)
+check("and the twins could keep going", uncapped[-1]["can_continue"], True)
+check("nothing is written to a ledger nobody reads", db.rows("discussion_usage"), [])
+check("the room shows no allowance",
+      (uncapped[-1]["conversation"]["daily_limit"],
+       uncapped[-1]["conversation"]["my_daily_left"],
+       uncapped[-1]["conversation"]["daily_resets_at"]), (None, None, None))
+main.probe_limits_schema()
+off_health = TestClient(main.app).get("/api/health").json()
+check("the health page says the limit is off",
+      (off_health["discussion_daily_credit_limit"], off_health["limits_schema"]), (None, "off"))
+check("and that is not a degraded deploy", off_health["status"], "ok")
+
+# Zero pauses twin rounds without a deploy; typing carries on.
+main = load(daily_limit="0")
+client = TestClient(main.app, raise_server_exceptions=False)
+db = social_db()
+main.supabase = db
+befriend(db)
+conversation_id = start_discussion(client).json()["conversation"]["id"]
+calls = script(main, [])
+paused = deliberate(client, conversation_id).json()
+check("a zero limit runs no rounds", (paused["rounds_run"], len(calls)), (0, 0))
+check("and says the rounds are paused",
+      paused["messages"][0]["content"], deliberation.ROUNDS_PAUSED)
+check("the room carries the same line",
+      paused["conversation"]["blocked_detail"], deliberation.ROUNDS_PAUSED)
+
+# Without the 0.4.5 table: spending fails closed, reading does not.
+main = load()
+client = TestClient(main.app, raise_server_exceptions=False)
+db = social_db()
+db.missing = {"discussion_usage"}
+main.supabase = db
+befriend(db)
+started = start_discussion(client)
+check("a discussion still opens without the 0.4.5 table", started.status_code, 200)
+conversation_id = started.json()["conversation"]["id"]
+calls = script(main, [])
+refused = deliberate(client, conversation_id)
+check("a round is refused rather than run uncounted", refused.status_code, 503)
+check("the refusal names the 0.4.5 migration",
+      "0002_discussion_limits_0.4.5.sql" in refused.json()["detail"], True)
+check("nobody is charged", (db.credits("user-a"), db.credits("user-b")), (20, 20))
+check("and the model is never called", len(calls), 0)
+unreadable = read(client, conversation_id)
+check("the room still loads", unreadable.status_code, 200)
+check("it just cannot show an allowance",
+      (unreadable.json()["conversation"]["daily_limit"],
+       unreadable.json()["conversation"]["my_daily_left"]), (3, None))
+check("the list still loads, with the usage unknown",
+      client.get("/api/social/conversations?user_id=user-a").json()["usage"]["left_today"], None)
+check("friends still load", client.get("/api/social/friends?user_id=user-a").status_code, 200)
+check("typing still works",
+      client.post(f"/api/social/conversations/{conversation_id}/messages",
+                  json={"user_id": "user-a", "content": "Hello?"}).status_code, 200)
+main.probe_limits_schema()
+missing_health = TestClient(main.app).get("/api/health").json()
+check("the boot probe notices the missing table", missing_health["limits_schema"], "missing")
+check("and degrades the health page", missing_health["status"], "degraded")
+check("the health page names the file to run",
+      "0002_discussion_limits_0.4.5.sql" in (missing_health["limits_remedy"] or ""), True)
+
+main = load()
+main.supabase = social_db()
+main.probe_limits_schema()
+ready_health = TestClient(main.app).get("/api/health").json()
+check("a migrated database reads ready", ready_health["limits_schema"], "ready")
+check("with the limit on the health page", ready_health["discussion_daily_credit_limit"], 3)
+check("the health page reports this release", ready_health["version"], "0.4.5")
+check("and a fully migrated deploy is ok", ready_health["status"], "ok")
 
 # --- report --------------------------------------------------------------
 failed = 0

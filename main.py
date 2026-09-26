@@ -3,6 +3,7 @@ import logging
 import os
 import re
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 from typing import Optional
 
 from fastapi import FastAPI, HTTPException
@@ -19,7 +20,7 @@ load_dotenv()
 
 logger = logging.getLogger("personais.engine")
 
-APP_VERSION = "0.4.4"
+APP_VERSION = "0.4.5"
 
 # Result of the boot-time self test, surfaced on /api/health.
 engine_selftest = {"status": "not run", "detail": None}
@@ -52,6 +53,8 @@ async def lifespan(_app: FastAPI):
     # of this process, so it is read once at boot and reported on /api/health
     # rather than discovered by the first person who tries to add a friend.
     asyncio.get_running_loop().run_in_executor(None, probe_social_schema)
+    # Likewise the 0.4.5 table that daily discussion allowances are counted in.
+    asyncio.get_running_loop().run_in_executor(None, probe_limits_schema)
     yield
 
 
@@ -104,6 +107,29 @@ def positive_int(name: str, default: int) -> int:
         return default
     if value <= 0:
         print(f"⚠️  {name}={value} must be positive — using {default}.")
+        return default
+    return value
+
+
+def daily_limit_setting(name: str, default: int) -> Optional[int]:
+    """Read a daily allowance from the environment.
+
+    A whole number is the allowance, and 0 means none at all — a way to pause
+    what it meters without a deploy. 'off' removes the limit. Anything else
+    keeps the default: a typo must never quietly turn a spending limit off.
+    """
+    raw = clean_secret(os.getenv(name))
+    if not raw:
+        return default
+    if raw.lower() in ("off", "none", "unlimited"):
+        return None
+    try:
+        value = int(raw)
+    except ValueError:
+        print(f"⚠️  {name}={raw!r} is not a number or 'off' — using {default}.")
+        return default
+    if value < 0:
+        print(f"⚠️  {name}={value} cannot be negative — using {default}.")
         return default
     return value
 
@@ -591,9 +617,27 @@ DELIBERATION_ROUND_CAP = positive_int("DELIBERATION_ROUND_CAP", 50)
 DELIBERATION_ROUNDS_PER_REQUEST = positive_int("DELIBERATION_ROUNDS_PER_REQUEST", 1)
 TWIN_MAX_TOKENS = positive_int("TWIN_MAX_TOKENS", 512)
 
+# Since 0.4.5: how many credits one person may spend on discussions per UTC
+# day. A round costs each side one, so the default of three is three rounds a
+# day for each of you. The balance still has to cover them; this caps how fast
+# it can be spent on twins that will not agree.
+DISCUSSION_DAILY_CREDIT_LIMIT = daily_limit_setting("DISCUSSION_DAILY_CREDIT_LIMIT", 3)
+
+
+def now_utc() -> datetime:
+    """The clock daily allowances are counted against.
+
+    Looked up by name on every request, so a test can move it to tomorrow.
+    """
+    return datetime.now(timezone.utc)
+
+
 # Whether this database has had the 0.4.4 migration run against it. Surfaced on
 # /api/health next to the engine checks.
 social_status = {"status": "not run", "detail": None}
+
+# The same, for the 0.4.5 table the daily allowance is counted in.
+limits_status = {"status": "not run", "detail": None}
 
 
 def probe_social_schema() -> None:
@@ -621,6 +665,33 @@ def probe_social_schema() -> None:
         return
     social_status.update(status="ready", detail=None)
     logger.info("Social schema is present")
+
+
+def probe_limits_schema() -> None:
+    """Check the 0.4.5 daily-limit table exists, and say which file adds it."""
+    if DISCUSSION_DAILY_CREDIT_LIMIT is None:
+        # Nothing is counted with the limit off, so there is nothing to need.
+        limits_status.update(status="off", detail=None)
+        return
+    if not (supabase_url and supabase_key):
+        limits_status.update(status="unknown", detail="Supabase is not configured")
+        return
+    try:
+        supabase.table("discussion_usage").select("id").limit(1).execute()
+    except Exception as e:
+        if social.looks_like_missing_schema(e):
+            limits_status.update(status="missing", detail=social.LIMITS_REMEDY)
+            logger.error("Daily-limit schema missing — %s", e)
+            print(f"🛑 CRITICAL ERROR: {social.LIMITS_REMEDY}")
+        else:
+            limits_status.update(
+                status="unknown",
+                detail=f"{type(e).__name__} reading the daily-limit table",
+            )
+            logger.warning("Could not verify the daily-limit schema: %s", type(e).__name__)
+        return
+    limits_status.update(status="ready", detail=None)
+    logger.info("Daily-limit schema is present")
 
 
 # One short message per boot. Set ENGINE_SELFTEST=off to skip it.
@@ -694,6 +765,9 @@ async def health_check():
         # database that never had the migration run is a degraded deploy even
         # though one-to-one chat still works on it.
         and social_status["status"] != "missing"
+        # Without the 0.4.5 table twin rounds refuse to run, since an allowance
+        # nobody can count is one nobody can enforce.
+        and limits_status["status"] != "missing"
     )
     return {
         "status": "ok" if healthy else "degraded",
@@ -714,6 +788,10 @@ async def health_check():
         "social_schema": social_status["status"],
         "social_remedy": social_status["detail"],
         "social_auth_required": SOCIAL_REQUIRE_AUTH,
+        # null when DISCUSSION_DAILY_CREDIT_LIMIT is off.
+        "discussion_daily_credit_limit": DISCUSSION_DAILY_CREDIT_LIMIT,
+        "limits_schema": limits_status["status"],
+        "limits_remedy": limits_status["detail"],
         # Every tier shares one model until a pro model is available on this
         # key; kept in the response so the routing is visible, not implied.
         "models": {"free": CHAT_MODEL, "pro": CHAT_MODEL},
@@ -789,6 +867,8 @@ app.include_router(
         round_cap=DELIBERATION_ROUND_CAP,
         rounds_per_request=DELIBERATION_ROUNDS_PER_REQUEST,
         twin_max_tokens=TWIN_MAX_TOKENS,
+        daily_credit_limit=DISCUSSION_DAILY_CREDIT_LIMIT,
+        clock=lambda: now_utc(),
     ),
     prefix="/api",
 )

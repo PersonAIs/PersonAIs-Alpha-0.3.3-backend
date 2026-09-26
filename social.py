@@ -12,7 +12,12 @@ Three things live here:
 3.  **Deliberation.** A round is one turn from each twin, costing its owner one
     credit. After each round the closing twin leaves a proposal, and both
     humans vote on it. Agreement ends the discussion; a disagreement sends the
-    twins round again — and keeps sending them until the credits are gone.
+    twins round again — and keeps sending them until the credits are gone, or
+    (since 0.4.5) until somebody has used today's discussion allowance.
+
+Every credit a twin spends is written to `discussion_usage` with a timestamp,
+and today's usage is counted from those rows rather than kept as a running
+total, so nothing ever has to be reset at midnight.
 
 The module has no globals of its own: the Supabase client, the model call and
 the identity check are all handed in by `main.py`, which keeps this file
@@ -39,6 +44,17 @@ MIGRATION_REMEDY = (
     "The Alpha 0.4.4 social tables are missing from this Supabase project. Run "
     "migrations/0001_social_0.4.4.sql from the backend repo (Supabase dashboard → "
     "SQL Editor → New query → paste → Run), then try again."
+)
+
+# The 0.4.5 table only counts spending, so a deploy without it keeps friends and
+# transcripts working and pauses the one thing it cannot police: twin rounds.
+# An allowance that cannot be counted is not enforced by guessing.
+LIMITS_REMEDY = (
+    "Twin rounds are paused: the Alpha 0.4.5 daily-limit table is missing from "
+    "this Supabase project, so nobody's daily allowance can be counted. Run "
+    "migrations/0002_discussion_limits_0.4.5.sql from the backend repo (Supabase "
+    "dashboard → SQL Editor → New query → paste → Run; run 0001 first if it never "
+    "was), then try again."
 )
 
 # Ambiguous characters are left out: a friend code gets read aloud and typed in
@@ -142,6 +158,8 @@ def build_social_router(
     round_cap=50,
     rounds_per_request=2,
     twin_max_tokens=512,
+    daily_credit_limit=None,
+    clock=None,
 ):
     """Build the /api/social router.
 
@@ -159,11 +177,18 @@ def build_social_router(
             continues by calling again, so a request stays short enough not to
             time out and the UI can show each round as it lands.
         twin_max_tokens: budget for one twin turn.
+        daily_credit_limit: credits each person may spend on discussions per
+            UTC day, or None for no daily limit. Zero pauses twin rounds.
+        clock: callable returning the current UTC datetime; today's allowance
+            is counted against it. Injected so a test can move to tomorrow.
     """
     router = APIRouter(prefix="/social", tags=["social"])
 
+    def now():
+        return clock() if clock else datetime.now(timezone.utc)
+
     # --- storage helpers -------------------------------------------------
-    def run(query, what):
+    def run(query, what, remedy=MIGRATION_REMEDY):
         """Execute a Supabase query, turning its failures into HTTP errors."""
         try:
             return rows_of(query.execute())
@@ -172,7 +197,7 @@ def build_social_router(
         except Exception as e:
             if looks_like_missing_schema(e):
                 logger.error("Social schema missing while %s: %s", what, e)
-                raise HTTPException(status_code=503, detail=MIGRATION_REMEDY)
+                raise HTTPException(status_code=503, detail=remedy)
             logger.exception("Database error while %s", what)
             raise HTTPException(
                 status_code=500,
@@ -348,6 +373,86 @@ def build_social_router(
         profile["credits_balance"] = balance
         return balance
 
+    # --- the daily allowance (0.4.5) --------------------------------------
+    def usage_today(user_ids, strict):
+        """Credits each person has spent on discussions today, by user id.
+
+        Returns {} when there is no daily limit, since there is nothing to
+        count. When the 0.4.5 table is missing, a caller about to spend
+        (`strict`) gets a 503 naming the migration, and a read gets None — the
+        page still loads, it just cannot show an allowance.
+        """
+        if daily_credit_limit is None:
+            return {}
+        ids = [i for i in dict.fromkeys(user_ids) if i]
+        if not ids:
+            return {}
+        start, _ = deliberation.day_window(now())
+        query = (
+            db().table("discussion_usage").select("user_id, credits")
+            .in_("user_id", ids).gte("created_at", start.isoformat())
+        )
+        if strict:
+            rows = run(query, "count today's discussion credits", remedy=LIMITS_REMEDY)
+        else:
+            try:
+                rows = rows_of(query.execute())
+            except Exception as e:
+                logger.warning("Could not count today's discussion credits: %s",
+                               type(e).__name__)
+                return None
+        used = {}
+        for row in rows:
+            used[row["user_id"]] = used.get(row["user_id"], 0) + int(row.get("credits") or 1)
+        return used
+
+    def record_usage(user_id, conversation_id, round_number):
+        """Write down one credit a twin turn spent, against today.
+
+        Stamped from the same clock the allowance is counted against, so the
+        write and the count can never disagree about which day it was.
+        """
+        run(
+            db().table("discussion_usage").insert({
+                "user_id": user_id,
+                "conversation_id": conversation_id,
+                "round": round_number,
+                "credits": 1,
+                "created_at": now().isoformat(),
+            }),
+            "record today's discussion usage",
+            remedy=LIMITS_REMEDY,
+        )
+
+    def allowances_for(member_ids, used):
+        """What each member may still spend today, or None when uncapped."""
+        if daily_credit_limit is None or used is None:
+            return None
+        return [
+            deliberation.allowance_left(used.get(mid, 0), daily_credit_limit)
+            for mid in member_ids
+        ]
+
+    def usage_summary(user_id, used):
+        """Your own daily allowance, as the pages show it."""
+        if daily_credit_limit is None:
+            return {"daily_limit": None, "used_today": None, "left_today": None,
+                    "resets_at": None}
+        _, resets_at = deliberation.day_window(now())
+        spent = None if used is None else int(used.get(user_id, 0))
+        return {
+            "daily_limit": daily_credit_limit,
+            "used_today": spent,
+            "left_today": (
+                None if spent is None
+                else deliberation.allowance_left(spent, daily_credit_limit)
+            ),
+            "resets_at": resets_at.isoformat(),
+        }
+
+    def member_ids_of(members):
+        return [m.get("user_id") for m in members]
+
     # --- view models -----------------------------------------------------
     def message_view(msg, profiles):
         owner = profiles.get(msg.get("user_id"))
@@ -361,45 +466,83 @@ def build_social_router(
             "created_at": msg.get("created_at"),
         }
 
-    def conversation_view(conversation, members, profiles, user_id):
+    def conversation_view(conversation, members, profiles, user_id, used):
+        """One discussion as its members see it.
+
+        `used` is today's discussion spending by user id (from usage_today),
+        or None when it could not be counted.
+        """
         me = next((m for m in members if m.get("user_id") == user_id), {})
         partner_member = next((m for m in members if m.get("user_id") != user_id), {})
-        partner = profiles.get(partner_member.get("user_id"))
+        partner_id = partner_member.get("user_id")
+        partner = profiles.get(partner_id)
         mine = profiles.get(user_id, {})
         round_number = int(conversation.get("round") or 0)
+        member_ids = member_ids_of(members)
         balances = [
-            int(profiles.get(m.get("user_id"), {}).get("credits_balance") or 0)
-            for m in members
+            int(profiles.get(mid, {}).get("credits_balance") or 0) for mid in member_ids
         ]
+        allowances = allowances_for(member_ids, used)
+        daily_left = dict(zip(member_ids, allowances)) if allowances is not None else {}
+        rounds_left = round_cap - round_number
+
+        status = conversation.get("status") or "open"
+        stop_reason = conversation.get("stop_reason")
+        can_deliberate = deliberation.can_continue(balances, rounds_left, status, allowances)
+        blocked = None
+        if not can_deliberate and status != "resolved":
+            _, blocked = deliberation.affordable_rounds(balances, 1, rounds_left, allowances)
+        if status == "exhausted" and can_deliberate:
+            # What stopped the twins was a budget, and the budget is back — a
+            # top-up, or a new day. Show the discussion as it now stands rather
+            # than as it was when they stopped.
+            status = "deliberating" if conversation.get("current_proposal") else "open"
+            stop_reason = None
+
+        _, resets_at = deliberation.day_window(now())
         return {
             "id": conversation.get("id"),
             "topic": conversation.get("topic"),
             "mode": conversation.get("mode") or "manual",
-            "status": conversation.get("status") or "open",
+            "status": status,
             "round": round_number,
             "round_cap": round_cap,
             "proposal": conversation.get("current_proposal"),
-            "stop_reason": conversation.get("stop_reason"),
-            "stop_detail": deliberation.stop_message(conversation.get("stop_reason")),
+            "stop_reason": stop_reason,
+            "stop_detail": deliberation.stop_message(stop_reason, daily_credit_limit),
             "updated_at": conversation.get("updated_at"),
             "partner": public_profile(partner),
             "my_verdict": me.get("verdict") or "pending",
             "partner_verdict": partner_member.get("verdict") or "pending",
             "my_credits": int(mine.get("credits_balance") or 0),
-            "partner_credits": int(
-                profiles.get(partner_member.get("user_id"), {}).get("credits_balance") or 0
-            ),
-            "can_deliberate": deliberation.can_continue(
-                balances, round_cap - round_number, conversation.get("status") or "open"
+            "partner_credits": int(profiles.get(partner_id, {}).get("credits_balance") or 0),
+            "can_deliberate": can_deliberate,
+            # Why another round cannot run right now, when it cannot — live,
+            # unlike stop_reason, which records why the twins last stopped.
+            "blocked_reason": blocked,
+            "blocked_detail": deliberation.stop_message(blocked, daily_credit_limit) or None,
+            "daily_limit": daily_credit_limit,
+            "my_daily_left": daily_left.get(user_id),
+            "partner_daily_left": daily_left.get(partner_id),
+            "daily_resets_at": (
+                resets_at.isoformat() if daily_credit_limit is not None else None
             ),
         }
+
+    def view_of(conversation, members, profiles, user_id):
+        """conversation_view, counting today's usage for it."""
+        used = usage_today(member_ids_of(members), strict=False)
+        return conversation_view(conversation, members, profiles, user_id, used)
 
     # --- profile ---------------------------------------------------------
     @router.get("/me")
     async def read_me(user_id: Optional[str] = None,
                       authorization: Optional[str] = Header(None)):
         uid = identify(authorization, user_id)
-        return {"profile": public_profile(ensure_profile(uid), include_private=True)}
+        return {
+            "profile": public_profile(ensure_profile(uid), include_private=True),
+            "usage": usage_summary(uid, usage_today([uid], strict=False)),
+        }
 
     @router.post("/me")
     async def update_me(req: ProfileUpdate,
@@ -609,6 +752,7 @@ def build_social_router(
         friends.sort(key=lambda f: (f.get("display_name") or "").lower())
         return {
             "me": public_profile(me, include_private=True),
+            "usage": usage_summary(uid, usage_today([uid], strict=False)),
             "friends": friends,
             "incoming": incoming,
             "outgoing": outgoing,
@@ -652,7 +796,7 @@ def build_social_router(
         )
 
         conv, members, _messages, profiles = load_conversation(conversation["id"], uid)
-        return {"conversation": conversation_view(conv, members, profiles, uid)}
+        return {"conversation": view_of(conv, members, profiles, uid)}
 
     @router.get("/conversations")
     async def list_conversations(user_id: Optional[str] = None,
@@ -666,7 +810,10 @@ def build_social_router(
         )
         ids = [row["conversation_id"] for row in mine]
         if not ids:
-            return {"conversations": []}
+            return {
+                "conversations": [],
+                "usage": usage_summary(uid, usage_today([uid], strict=False)),
+            }
 
         conversations = run(
             db().table("conversations").select("*").in_("id", ids),
@@ -677,13 +824,15 @@ def build_social_router(
             "read your discussions",
         )
         profiles = profiles_by_id([m.get("user_id") for m in all_members])
+        # One count for everybody on the page, not one per room.
+        used = usage_today([uid] + member_ids_of(all_members), strict=False)
 
         views = []
         for conversation in conversations:
             members = [m for m in all_members if m.get("conversation_id") == conversation.get("id")]
-            views.append(conversation_view(conversation, members, profiles, uid))
+            views.append(conversation_view(conversation, members, profiles, uid, used))
         views.sort(key=lambda c: c.get("updated_at") or "", reverse=True)
-        return {"conversations": views}
+        return {"conversations": views, "usage": usage_summary(uid, used)}
 
     @router.get("/conversations/{conversation_id}")
     async def read_conversation(conversation_id: str,
@@ -692,7 +841,7 @@ def build_social_router(
         uid = identify(authorization, user_id)
         conversation, members, messages, profiles = load_conversation(conversation_id, uid)
         return {
-            "conversation": conversation_view(conversation, members, profiles, uid),
+            "conversation": view_of(conversation, members, profiles, uid),
             "messages": [message_view(m, profiles) for m in messages],
         }
 
@@ -705,9 +854,7 @@ def build_social_router(
             raise HTTPException(status_code=400, detail="Mode is 'manual' or 'auto'.")
         updated = touch_conversation(conversation_id, {"mode": req.mode})
         return {
-            "conversation": conversation_view(
-                {**conversation, **updated}, members, profiles, uid
-            )
+            "conversation": view_of({**conversation, **updated}, members, profiles, uid)
         }
 
     @router.post("/conversations/{conversation_id}/messages")
@@ -732,9 +879,7 @@ def build_social_router(
         updated = touch_conversation(conversation_id, {})
         return {
             "message": message_view(message, profiles),
-            "conversation": conversation_view(
-                {**conversation, **updated}, members, profiles, uid
-            ),
+            "conversation": view_of({**conversation, **updated}, members, profiles, uid),
         }
 
     @router.post("/conversations/{conversation_id}/deliberate")
@@ -770,9 +915,12 @@ def build_social_router(
 
         member_ids = [m["user_id"] for m in members]
         balances = [int(profiles.get(mid, {}).get("credits_balance") or 0) for mid in member_ids]
+        # Counted strictly: this request is about to spend, and a table that
+        # cannot be read is a 503 here, before any model call or charge.
+        used = usage_today(member_ids, strict=True)
         requested = max(1, min(int(req.rounds or 1), rounds_per_request))
         allowed, stop_reason = deliberation.affordable_rounds(
-            balances, requested, round_cap - round_number
+            balances, requested, round_cap - round_number, allowances_for(member_ids, used)
         )
 
         if allowed == 0:
@@ -783,7 +931,8 @@ def build_social_router(
             if stop_reason and conversation.get("stop_reason") != stop_reason:
                 new_messages.append(
                     add_message(conversation_id, None, "system",
-                                deliberation.stop_message(stop_reason), round_number)
+                                deliberation.stop_message(stop_reason, daily_credit_limit),
+                                round_number)
                 )
             updated = touch_conversation(
                 conversation_id, {"status": status, "stop_reason": stop_reason}
@@ -791,7 +940,7 @@ def build_social_router(
             return {
                 "messages": [message_view(m, profiles) for m in new_messages],
                 "conversation": conversation_view(
-                    {**conversation, **updated}, members, profiles, uid
+                    {**conversation, **updated}, members, profiles, uid, used
                 ),
                 "rounds_run": 0,
                 "can_continue": False,
@@ -842,8 +991,12 @@ def build_social_router(
                 )
 
                 # Charged only once the model has actually answered: a provider
-                # failure raises out of generate() and must not cost a credit.
+                # failure raises out of generate() and must not cost a credit,
+                # nor count against today's allowance.
                 spend_credit(speaker)
+                if daily_credit_limit is not None:
+                    record_usage(speaker_id, conversation_id, round_number)
+                    used[speaker_id] = used.get(speaker_id, 0) + 1
                 verdict_notes[speaker_id] = None
 
                 message = add_message(conversation_id, speaker_id, "twin", reply, round_number)
@@ -863,13 +1016,19 @@ def build_social_router(
                              "verdict_note": None})
 
         balances = [int(profiles.get(mid, {}).get("credits_balance") or 0) for mid in member_ids]
-        keep_going = deliberation.can_continue(balances, round_cap - round_number, "deliberating")
-        _, next_stop = deliberation.affordable_rounds(balances, 1, round_cap - round_number)
+        allowances = allowances_for(member_ids, used)
+        keep_going = deliberation.can_continue(
+            balances, round_cap - round_number, "deliberating", allowances
+        )
+        _, next_stop = deliberation.affordable_rounds(
+            balances, 1, round_cap - round_number, allowances
+        )
 
         if not keep_going and next_stop:
             new_messages.append(
                 add_message(conversation_id, None, "system",
-                            deliberation.stop_message(next_stop), round_number)
+                            deliberation.stop_message(next_stop, daily_credit_limit),
+                            round_number)
             )
 
         updated = touch_conversation(conversation_id, {
@@ -882,7 +1041,7 @@ def build_social_router(
         return {
             "messages": [message_view(m, profiles) for m in new_messages],
             "conversation": conversation_view(
-                {**conversation, **updated}, members, profiles, uid
+                {**conversation, **updated}, members, profiles, uid, used
             ),
             "rounds_run": allowed,
             "can_continue": keep_going,
@@ -896,8 +1055,8 @@ def build_social_router(
 
         Both agree and it is settled. One disagrees and the twins go again —
         the objection is handed to that person's twin as its brief for the next
-        round, and the round after that, until somebody agrees or the credits
-        run out.
+        round, and the round after that, until somebody agrees, the credits
+        run out, or one of them has used today's discussion allowance.
         """
         uid = identify(authorization, req.user_id)
         conversation, members, _messages, profiles = load_conversation(conversation_id, uid)
@@ -944,9 +1103,7 @@ def build_social_router(
         return {
             "outcome": outcome,
             "messages": [message_view(m, profiles) for m in new_messages],
-            "conversation": conversation_view(
-                {**conversation, **updated}, members, profiles, uid
-            ),
+            "conversation": view_of({**conversation, **updated}, members, profiles, uid),
         }
 
     return router

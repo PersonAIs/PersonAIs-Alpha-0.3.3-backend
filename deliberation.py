@@ -7,13 +7,19 @@ it is, when a round may run and when the twins have to stop are the part of
 credits when it is wrong — so they are kept where they can be read and tested
 on their own, without a live Supabase or a live API key.
 
-The two hard limits live here:
+The hard limits live here:
 
 *   A round needs one credit from **each** participant, because a round is one
     turn from each twin. When either side cannot pay, the round does not start.
+*   Since 0.4.5 each person may spend only so many credits a day on
+    discussions (three by default). A day's allowance caps rounds exactly the
+    way a balance does — the poorer side sets the limit — and it comes back at
+    midnight UTC.
 *   `ROUND_CAP` is a runaway guard, not the intended stop. The intended stop is
     an agreement, or credits running out.
 """
+
+from datetime import timedelta, timezone
 
 # Twins are talking to each other, not writing essays. A short limit keeps a
 # round affordable, keeps the transcript readable, and stops one twin from
@@ -33,8 +39,21 @@ TRANSCRIPT_TURNS = 24
 STOP_REASONS = {
     "credits_exhausted": "Both twins have talked until the credits ran out. Top up to carry on.",
     "round_cap": "This discussion has hit the round limit for a single conversation.",
+    "daily_limit": (
+        "One of you has used today's {allowance}, so the twins have stopped for the "
+        "day. They can carry on after the reset at midnight UTC."
+    ),
     "resolved": "Both of you agreed, so the twins have stopped.",
 }
+
+# A daily limit of zero is an operator switching twin rounds off, not anybody
+# running out, so it gets its own sentence rather than "today's 0 credits".
+ROUNDS_PAUSED = "Twin rounds are paused on this server for now. You can still type to each other."
+
+
+def plural(count, noun):
+    """'1 credit', '3 credits'."""
+    return f"{count} {noun}{'' if count == 1 else 's'}"
 
 
 def display_name(profile, fallback="Your partner"):
@@ -190,34 +209,76 @@ def verdict_outcome(verdicts):
     return "waiting"
 
 
-def affordable_rounds(balances, requested, rounds_left):
+def affordable_rounds(balances, requested, rounds_left, allowances=None):
     """How many rounds may actually run now, and why it is not more.
 
     A round is one turn from each twin and costs its owner one credit, so the
-    poorer of the two participants sets the limit. Returns
-    `(rounds, stop_reason)` where `stop_reason` is set only when the answer is
-    zero — a short-but-nonzero answer is just this request's budget, not a
-    reason to tell anybody the conversation is over.
+    poorer of the two participants sets the limit. `allowances` is what each
+    participant may still spend on discussions today, or None when there is no
+    daily limit; it caps rounds the same way a balance does.
+
+    Returns `(rounds, stop_reason)` where `stop_reason` is set only when the
+    answer is zero — a short-but-nonzero answer is just this request's budget,
+    not a reason to tell anybody the conversation is over. The daily limit is
+    reported last: an empty balance or the round cap will not fix themselves
+    overnight, and a stop reason must never promise that they will.
     """
     affordable = min(balances) if balances else 0
-    allowed = max(0, min(affordable, requested, rounds_left))
+    budget = affordable
+    today = None
+    if allowances is not None:
+        today = min(allowances) if allowances else 0
+        budget = min(budget, today)
+    allowed = max(0, min(budget, requested, rounds_left))
     if allowed > 0:
         return allowed, None
     if affordable < 1:
         return 0, "credits_exhausted"
     if rounds_left < 1:
         return 0, "round_cap"
+    if today is not None and today < 1:
+        return 0, "daily_limit"
     return 0, None
 
 
-def can_continue(balances, rounds_left, status):
+def can_continue(balances, rounds_left, status, allowances=None):
     """Whether another round is possible after the one that just ran."""
     if status == "resolved":
         return False
-    rounds, _ = affordable_rounds(balances, 1, rounds_left)
+    rounds, _ = affordable_rounds(balances, 1, rounds_left, allowances)
     return rounds > 0
 
 
-def stop_message(reason):
-    """The system line written into the transcript when the twins stop."""
+def day_window(now):
+    """The UTC day `now` falls in, as `(start, next_reset)`.
+
+    One calendar day, the same for everybody: an allowance that resets at a
+    fixed, published time is one people can plan around, where a rolling
+    24 hours would free up a credit at a different minute for each of them.
+    """
+    start = now.astimezone(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
+    return start, start + timedelta(days=1)
+
+
+def allowance_left(used, daily_limit):
+    """What one person may still spend on discussions today.
+
+    None means there is no daily limit, which is not the same as zero left.
+    """
+    if daily_limit is None:
+        return None
+    return max(0, daily_limit - int(used or 0))
+
+
+def stop_message(reason, daily_limit=None):
+    """The line written into the transcript, and shown, when the twins stop."""
+    if reason == "daily_limit":
+        if daily_limit == 0:
+            return ROUNDS_PAUSED
+        allowance = (
+            plural(daily_limit, "discussion credit")
+            if daily_limit
+            else "discussion credits"
+        )
+        return STOP_REASONS["daily_limit"].format(allowance=allowance)
     return STOP_REASONS.get(reason or "", "")
